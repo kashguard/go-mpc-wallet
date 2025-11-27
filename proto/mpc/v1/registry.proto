@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package mpc.v1;
+
+import "proto/mpc/v1/common.proto";
+
+option go_package = "github.com/kashguard/go-mpc-wallet/internal/pb";
+
+// 服务注册和发现服务
+service MPCRegistry {
+  // 注册节点
+  rpc RegisterNode(RegisterRequest) returns (RegisterResponse);
+
+  // 注销节点
+  rpc UnregisterNode(UnregisterRequest) returns (UnregisterResponse);
+
+  // 发现节点
+  rpc DiscoverNodes(DiscoveryRequest) returns (DiscoveryResponse);
+
+  // 获取节点信息
+  rpc GetNodeInfo(NodeInfoRequest) returns (NodeInfoResponse);
+
+  // 健康检查
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // 监听节点变化
+  rpc WatchNodes(WatchRequest) returns (stream WatchResponse);
+}
+
+// 注册相关消息
+message RegisterRequest {
+  NodeInfo node = 1;
+  repeated string capabilities = 2;  // 支持的协议: ["gg18", "gg20", "frost"]
+  repeated string supported_chains = 3;  // 支持的链: ["bitcoin", "ethereum"]
+  map<string, string> tags = 4;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string registration_id = 2;
+  string message = 3;
+  string registered_at = 4;
+}
+
+message UnregisterRequest {
+  string node_id = 1;
+}
+
+message UnregisterResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 发现相关消息
+message DiscoveryRequest {
+  string node_type = 1;  // "coordinator", "participant", or empty for all
+  repeated string capabilities = 2;  // 需要的功能
+  repeated string supported_chains = 3;  // 支持的链
+  int32 limit = 4;  // 返回数量限制
+  bool healthy_only = 5;  // 只返回健康节点
+}
+
+message DiscoveryResponse {
+  repeated NodeInfo nodes = 1;
+  int32 total_count = 2;
+}
+
+// 节点信息相关消息
+message NodeInfoRequest {
+  string node_id = 1;
+}
+
+message NodeInfoResponse {
+  NodeInfo node = 1;
+  bool exists = 2;
+}
+
+// 健康检查相关消息
+message HealthCheckRequest {
+  string node_id = 1;
+  string check_type = 2;  // "tcp", "http", "grpc"
+}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string status = 2;  // "passing", "warning", "critical"
+  string message = 3;
+  string checked_at = 4;
+  map<string, string> details = 5;
+}
+
+// 监听相关消息
+message WatchRequest {
+  string node_type = 1;
+  repeated string capabilities = 2;
+  bool include_health_updates = 3;
+}
+
+message WatchResponse {
+  string event_type = 1;  // "node_registered", "node_unregistered", "node_updated", "health_changed"
+  NodeInfo node = 2;
+  HealthCheckResponse health = 3;
+  string event_time = 4;
+}
+
+// 扩展的节点信息
+message ExtendedNodeInfo {
+  string node_id = 1;
+  string node_type = 2;  // "coordinator", "participant"
+  string endpoint = 3;   // gRPC endpoint, e.g., "localhost:50051"
+  string version = 4;
+  string status = 5;     // "online", "offline", "maintenance"
+  string registered_at = 6;
+  string last_heartbeat = 7;
+  string last_seen = 8;
+  repeated string capabilities = 9;
+  repeated string supported_chains = 10;
+  map<string, string> metadata = 11;
+  map<string, string> tags = 12;
+  HealthStatus health_status = 13;
+}

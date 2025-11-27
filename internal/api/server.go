@@ -20,6 +20,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	// MPC imports
+	"github.com/kashguard/go-mpc-wallet/internal/grpc"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/coordinator"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/key"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/node"
@@ -75,6 +76,15 @@ type Server struct {
 	NodeRegistry       *node.Registry
 	NodeDiscovery      *node.Discovery
 	SessionManager     *session.Manager
+
+	// gRPC services
+	GRPCServer        *grpc.Server
+	GRPCClient        *grpc.Client
+	NodeGRPCService   *grpc.NodeService
+	CoordGRPCService  *grpc.CoordinatorService
+	RegGRPCService    *grpc.RegistryService
+	HeartbeatService  *grpc.HeartbeatService
+	HeartbeatManager  *grpc.HeartbeatManager
 }
 
 // newServerWithComponents is used by wire to initialize the server components.

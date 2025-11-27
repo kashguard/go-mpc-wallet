@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package mpc.v1;
+
+option go_package = "github.com/kashguard/go-mpc-wallet/internal/pb";
+
+// 公共消息类型
+message NodeInfo {
+  string node_id = 1;
+  string node_type = 2;  // "coordinator" or "participant"
+  string endpoint = 3;   // gRPC endpoint
+  string version = 4;
+  string registered_at = 5;
+  string last_heartbeat = 6;
+  map<string, string> metadata = 7;
+}
+
+message HealthStatus {
+  bool overall_healthy = 1;
+  string summary = 2;
+  repeated HealthCheck checks = 3;
+}
+
+message HealthCheck {
+  string name = 1;
+  string status = 2;  // "passing", "warning", "critical"
+  string output = 3;
+  string checked_at = 4;
+}

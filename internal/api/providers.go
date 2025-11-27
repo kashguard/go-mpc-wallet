@@ -19,6 +19,7 @@ import (
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/protocol"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/session"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/signing"
+	"github.com/kashguard/go-mpc-wallet/internal/grpc"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/storage"
 	"github.com/kashguard/go-mpc-wallet/internal/persistence"
 	"github.com/kashguard/go-mpc-wallet/internal/push"
@@ -181,4 +182,51 @@ func NewCoordinatorServiceProvider(
 
 func NewParticipantServiceProvider(cfg config.Server, keyShareStorage storage.KeyShareStorage, protocolEngine protocol.Engine) *participant.Service {
 	return participant.NewService(cfg.MPC.NodeID, keyShareStorage, protocolEngine)
+}
+
+// gRPC相关Provider
+
+// NewGRPCServer 创建gRPC服务器
+func NewGRPCServer(cfg config.Server) (*grpc.Server, error) {
+	return grpc.NewServer(&cfg)
+}
+
+// NewGRPCClient 创建gRPC客户端
+func NewGRPCClient(cfg config.Server) (*grpc.Client, error) {
+	return grpc.NewClient(&grpc.Config{
+		Target: fmt.Sprintf("localhost:%d", cfg.MPC.GRPCPort),
+		TLS:    cfg.MPC.TLSEnabled,
+		Timeout: 30 * time.Second,
+	})
+}
+
+// NewNodeService 创建节点gRPC服务
+func NewNodeService(cfg config.Server) *grpc.NodeService {
+	return grpc.NewNodeService(cfg.MPC.NodeID)
+}
+
+// NewCoordinatorService 创建协调器gRPC服务
+func NewCoordinatorService(cfg config.Server) *grpc.CoordinatorService {
+	return grpc.NewCoordinatorService(cfg.MPC.NodeID)
+}
+
+// NewRegistryService 创建注册gRPC服务
+func NewRegistryService() *grpc.RegistryService {
+	return grpc.NewRegistryService()
+}
+
+// NewHeartbeatService 创建心跳服务
+func NewHeartbeatService(cfg config.Server, client *grpc.Client) *grpc.HeartbeatService {
+	return grpc.NewHeartbeatService(&grpc.HeartbeatConfig{
+		NodeID:        cfg.MPC.NodeID,
+		CoordinatorID: "coordinator", // TODO: 动态获取
+		Interval:      30 * time.Second,
+		Timeout:       10 * time.Second,
+		Client:        client,
+	})
+}
+
+// NewHeartbeatManager 创建心跳管理器
+func NewHeartbeatManager() *grpc.HeartbeatManager {
+	return grpc.NewHeartbeatManager()
 }
