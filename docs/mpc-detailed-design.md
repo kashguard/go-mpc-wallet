@@ -863,6 +863,40 @@ sequenceDiagram
 
 ## 3. 通信协议设计
 
+### 3.0 分布式通信架构（tss-lib实现）
+
+#### 3.0.1 gRPC通信层
+
+**架构说明**：
+- **gRPC客户端**（`internal/mpc/communication/grpc_client.go`）：负责向其他节点发送tss-lib协议消息
+- **gRPC服务端**（`internal/mpc/communication/grpc_server.go`）：接收来自其他节点的消息，并转发给协议引擎
+- **消息路由**：`messageRouter`函数将`tss.Message`序列化后通过gRPC发送到目标节点
+- **消息处理**：`ProcessIncomingKeygenMessage`和`ProcessIncomingSigningMessage`接收消息并更新Party状态
+
+**通信流程**：
+```mermaid
+sequenceDiagram
+    participant P1 as Participant 1
+    participant GRPC1 as gRPC Client 1
+    participant GRPC2 as gRPC Server 2
+    participant P2 as Participant 2
+    participant TSS as tss-lib Party
+
+    P1->>TSS: 生成tss.Message
+    TSS-->>P1: tss.Message对象
+    P1->>GRPC1: SendSigningMessage(nodeID, msg)
+    GRPC1->>GRPC2: gRPC: SigningMessage (bytes)
+    GRPC2->>P2: ProcessIncomingSigningMessage(sessionID, fromNodeID, msgBytes)
+    P2->>TSS: party.UpdateFromBytes(msgBytes)
+    TSS-->>P2: 更新Party状态
+```
+
+**关键实现**：
+- **消息序列化**：使用`msg.WireBytes()`将`tss.Message`序列化为字节数组
+- **消息反序列化**：使用`tss.ParseWireMessage`解析接收到的字节数组
+- **会话管理**：通过`sessionID`关联消息和签名会话
+- **错误处理**：实现重试机制和超时控制
+
 ### 3.1 gRPC 接口设计
 
 #### 3.1.1 核心服务接口
