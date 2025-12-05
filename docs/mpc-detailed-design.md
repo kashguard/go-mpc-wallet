@@ -1,6 +1,6 @@
 # MPC 基础设施系统详细设计文档
 
-**版本**: v2.1
+**版本**: v2.2
 **文档类型**: 详细设计文档
 **创建日期**: 2024-11-28
 **基于**: MPC产品文档 + go-mpc-wallet项目代码 + MPCVault技术分析
@@ -1639,7 +1639,1048 @@ DeFi MPC 服务
 
 ---
 
-## 8. 性能优化设计
+## 8. 客户端集成与使用场景详解
+
+### 8.1 移动APP集成方案
+
+#### 8.1.1 架构设计选择
+
+基于 MPCVault 架构分析，移动APP（iOS/Android）集成MPC系统有三种主要方案：
+
+**方案A：轻量级客户端模式（推荐）**
+
+```mermaid
+graph TB
+    subgraph "移动APP"
+        A[业务层<br/>Client Program]
+        B[验证层<br/>Callback Verifier]
+        C[安全存储<br/>Secure Enclave]
+    end
+    
+    subgraph "云端服务"
+        D[云端代理<br/>Cloud Proxy]
+        E[密钥分片存储]
+    end
+    
+    subgraph "MPC网络"
+        F[Coordinator]
+        G[Participant节点]
+    end
+    
+    A -->|1. 发起签名请求| F
+    F -->|2. 通知| D
+    F -->|3. 回调验证| B
+    B -->|4. 用户确认| C
+    C -->|5. 生物认证| B
+    B -->|6. 批准200| F
+    D -->|7. 参与MPC| F
+    F -->|8. 返回结果| A
+```
+
+**特点**：
+- APP仅负责认证和批准，不直接参与MPC计算
+- 云端代理持有密钥分片并参与MPC
+- 支持后台执行和推送通知
+- 用户体验好，适合大多数场景
+
+**方案B：分离式架构（高安全场景）**
+
+```mermaid
+sequenceDiagram
+    participant APP as 移动APP<br/>Client Program
+    participant Verifier as Callback Verifier<br/>验证器
+    participant Signer as Client Signer<br/>签名器
+    participant Server as MPCVault Server
+    participant Nodes as MPC Nodes
+
+    APP->>Server: 1. 发起签名请求
+    Server->>Signer: 2. 通知签名器
+    Server->>Verifier: 3. 回调验证
+    Verifier->>Verifier: 4. 显示交易详情
+    Verifier->>Verifier: 5. 用户确认
+    Verifier->>Server: 6. 返回批准(200)
+    Signer->>Server: 7. 参与MPC计算
+    Server->>Nodes: 8. MPC协议执行
+    Nodes-->>Server: 9. 签名完成
+    Server->>APP: 10. 返回结果
+```
+
+**特点**：
+- 职责分离：业务层、验证层、签名层分离
+- 安全性高：验证和签名分离，降低单点风险
+- 移动端适配：充分利用系统安全能力（Secure Enclave/TrustZone）
+- 支持单设备或多设备部署
+
+**方案C：完全本地参与（企业内网）**
+
+```mermaid
+graph TB
+    subgraph "移动设备"
+        A[APP业务层]
+        B[Client Signer<br/>持有密钥分片]
+        C[Secure Enclave<br/>安全计算]
+    end
+    
+    subgraph "企业内网"
+        D[Coordinator]
+        E[Participant节点]
+    end
+    
+    A -->|发起请求| D
+    D -->|通知| B
+    B -->|参与MPC| C
+    C -->|签名计算| D
+    D -->|返回结果| A
+```
+
+**特点**：
+- APP直接参与MPC计算
+- 密钥分片存储在设备Secure Enclave中
+- 适合企业内网环境
+- 需要稳定的网络连接
+
+#### 8.1.2 iOS实现示例
+
+```swift
+// iOS MPC Wallet实现
+import Foundation
+import Security
+import LocalAuthentication
+
+class MPCWalletApp {
+    // 1. 业务层（Client Program）
+    class BusinessLayer {
+        private let apiClient: MPCVaultAPIClient
+        
+        func requestSigning(message: Data, keyID: String) async throws -> Signature {
+            // 创建签名请求
+            let request = SigningRequest(
+                keyID: keyID,
+                message: message,
+                messageType: .raw
+            )
+            
+            // 发送到服务器
+            return try await apiClient.createSigningRequest(request)
+        }
+    }
+    
+    // 2. 验证层（Callback Verifier）
+    class CallbackVerifier {
+        private let biometricAuth = LAContext()
+        
+        func verifySigningRequest(_ request: SigningRequest) async -> Bool {
+            // 显示交易详情
+            let approved = await showTransactionDetails(request)
+            
+            if approved {
+                // 生物认证
+                return await authenticateWithBiometrics()
+            }
+            
+            return false
+        }
+        
+        private func showTransactionDetails(_ request: SigningRequest) async -> Bool {
+            // 在主线程显示UI
+            return await MainActor.run {
+                // 显示交易确认界面
+                return true // 用户确认
+            }
+        }
+        
+        private func authenticateWithBiometrics() async -> Bool {
+            return await withCheckedContinuation { continuation in
+                biometricAuth.evaluatePolicy(
+                    .deviceOwnerAuthenticationWithBiometrics,
+                    localizedReason: "请验证以批准交易"
+                ) { success, error in
+                    continuation.resume(returning: success)
+                }
+            }
+        }
+    }
+    
+    // 3. 签名层（Client Signer - 可选）
+    class ClientSigner {
+        private let keyShareStorage: KeyShareStorage
+        private let protocolEngine: MPCProtocolEngine
+        
+        func participateInMPC(sessionID: String) async throws {
+            // 从Keychain加载密钥分片
+            let keyShare = try keyShareStorage.loadKeyShare()
+            
+            // 在Secure Enclave中执行MPC计算
+            return try await SecureEnclave.executeMPC(
+                keyShare: keyShare,
+                sessionID: sessionID
+            )
+        }
+    }
+    
+    // 4. 安全存储
+    class KeyShareStorage {
+        func storeKeyShare(_ share: KeyShare) throws {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: "mpc_key_share",
+                kSecValueData as String: share.encryptedData,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIAllow
+            ]
+            
+            SecItemAdd(query as CFDictionary, nil)
+        }
+        
+        func loadKeyShare() throws -> KeyShare {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccount as String: "mpc_key_share",
+                kSecReturnData as String: true
+            ]
+            
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            
+            guard status == errSecSuccess,
+                  let data = result as? Data else {
+                throw KeyShareError.notFound
+            }
+            
+            return try KeyShare.fromEncryptedData(data)
+        }
+    }
+}
+```
+
+#### 8.1.3 Android实现示例
+
+```kotlin
+// Android MPC Wallet实现
+import android.content.Context
+import androidx.biometric.BiometricPrompt
+import androidx.security.crypto.EncryptedFile
+import java.io.File
+
+class MPCWalletApp(private val context: Context) {
+    // 1. 业务层
+    class BusinessLayer(private val apiClient: MPCVaultAPIClient) {
+        suspend fun requestSigning(message: ByteArray, keyID: String): Signature {
+            val request = SigningRequest(
+                keyID = keyID,
+                message = message,
+                messageType = MessageType.RAW
+            )
+            
+            return apiClient.createSigningRequest(request)
+        }
+    }
+    
+    // 2. 验证层
+    class CallbackVerifier(private val context: Context) {
+        private val biometricPrompt = BiometricPrompt(
+            context as FragmentActivity,
+            ContextCompat.getMainExecutor(context),
+            BiometricPrompt.AuthenticationCallback()
+        )
+        
+        suspend fun verifySigningRequest(request: SigningRequest): Boolean {
+            // 显示交易详情
+            val approved = showTransactionDetails(request)
+            
+            if (approved) {
+                // 生物认证
+                return authenticateWithBiometrics()
+            }
+            
+            return false
+        }
+        
+        private suspend fun authenticateWithBiometrics(): Boolean {
+            return suspendCancellableCoroutine { continuation ->
+                val promptInfo = BiometricPrompt.PromptInfo.Builder()
+                    .setTitle("验证身份")
+                    .setSubtitle("请使用指纹或面部识别")
+                    .setNegativeButtonText("取消")
+                    .build()
+                
+                biometricPrompt.authenticate(promptInfo)
+                // 处理认证结果
+            }
+        }
+    }
+    
+    // 3. 安全存储（使用Android Keystore）
+    class KeyShareStorage(private val context: Context) {
+        private val keyAlias = "mpc_key_share"
+        
+        fun storeKeyShare(share: KeyShare) {
+            val keyStore = KeyStore.getInstance("AndroidKeyStore")
+            keyStore.load(null)
+            
+            val keyGenerator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore"
+            )
+            
+            val keyGenParameterSpec = KeyGenParameterSpec.Builder(
+                keyAlias,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setUserAuthenticationRequired(true)
+                .build()
+            
+            keyGenerator.init(keyGenParameterSpec)
+            keyGenerator.generateKey()
+            
+            // 加密并存储密钥分片
+            val encryptedData = encryptKeyShare(share)
+            // 存储到EncryptedFile
+        }
+    }
+}
+```
+
+#### 8.1.4 网络通信优化
+
+```swift
+// WebSocket长连接管理
+class MPCNetworkManager {
+    private var websocket: URLSessionWebSocketTask?
+    private var reconnectTimer: Timer?
+    
+    func connect() {
+        let url = URL(string: "wss://mpc.example.com/ws")!
+        websocket = URLSession.shared.webSocketTask(with: url)
+        websocket?.resume()
+        
+        receiveMessage()
+    }
+    
+    func receiveMessage() {
+        websocket?.receive { [weak self] result in
+            switch result {
+            case .success(let message):
+                self?.handleMPCMessage(message)
+                self?.receiveMessage() // 继续监听
+            case .failure(let error):
+                self?.handleError(error)
+                self?.reconnect()
+            }
+        }
+    }
+    
+    // 后台任务管理
+    func registerBackgroundTask() {
+        BGTaskScheduler.shared.register(
+            forTaskWithIdentifier: "com.mpc.signing",
+            using: nil
+        ) { task in
+            self.handleSigningTask(task: task as! BGProcessingTask)
+        }
+    }
+}
+```
+
+### 8.2 Client Signer部署策略
+
+#### 8.2.1 部署模式选择
+
+**问题：团队签名时，是否每个参与方都需要部署Client Signer？**
+
+**答案：不是必须的，取决于使用场景。**
+
+#### 8.2.2 场景分析
+
+**场景1：纯手动批准（不需要Client Signer）**
+
+```mermaid
+graph TB
+    A[团队成员1<br/>MPCVault App] -->|批准| C[签名请求]
+    B[团队成员2<br/>MPCVault App] -->|批准| C
+    D[团队成员3<br/>MPCVault App] -->|批准| C
+    C -->|达到阈值| E[MPC签名执行]
+    E --> F[交易完成]
+```
+
+**特点**：
+- 团队成员通过MPCVault App（iOS/Android）批准
+- 不需要部署Client Signer
+- 适合人工审核场景
+- 简单易用，适合小团队
+
+**部署配置**：
+```yaml
+team_configuration:
+  team_size: "3-10人"
+  approval_method: "MPCVault App"
+  client_signer_required: false
+  use_cases:
+    - "日常交易审批"
+    - "小额交易"
+    - "需要人工审核的场景"
+```
+
+**场景2：混合模式（推荐用于企业）**
+
+```mermaid
+graph TB
+    A[业务系统] -->|创建签名请求| B[MPCVault Server]
+    B -->|通知| C[Client Signer<br/>持有用户分片]
+    B -->|回调验证| D[Callback Verifier]
+    D -->|批准| B
+    C -->|参与MPC| E[MPC签名]
+    B -->|通知| F[团队成员1<br/>MPCVault App]
+    F -->|批准| B
+    B -->|通知| G[团队成员2<br/>MPCVault App]
+    G -->|批准| B
+    E -->|完成| H[交易执行]
+```
+
+**特点**：
+- 业务系统部署Client Signer（程序化创建交易）
+- 团队成员通过App批准
+- 适合企业级集成
+- 支持批量处理
+
+**部署配置**：
+```yaml
+enterprise_configuration:
+  business_system:
+    client_signer: true
+    location: "生产环境服务器"
+    purpose: "自动创建和签名交易"
+  
+  team_members:
+    - name: "财务经理"
+      role: "Manager"
+      approval_method: "MPCVault App"
+      client_signer: false
+    
+    - name: "技术负责人"
+      role: "Manager"
+      approval_method: "MPCVault App"
+      client_signer: false
+  
+  use_cases:
+    - "批量工资发放"
+    - "空投处理"
+    - "自动化交易"
+```
+
+**场景3：完全程序化（高级场景）**
+
+```mermaid
+graph TB
+    A[业务系统1] -->|创建请求| B[MPCVault Server]
+    B -->|通知| C[Client Signer 1]
+    B -->|回调| D[Callback Verifier]
+    D -->|批准| B
+    C -->|参与MPC| E[MPC签名]
+    B -->|通知| F[Client Signer 2<br/>可选，高可用]
+    F -->|参与MPC| E
+    E -->|完成| G[交易执行]
+```
+
+**特点**：
+- 部署多个Client Signer实现高可用
+- 完全自动化流程
+- 适合高频交易场景
+- 需要7x24小时服务
+
+**部署配置**：
+```yaml
+advanced_configuration:
+  client_signers:
+    - name: "Primary Signer"
+      location: "主数据中心"
+      purpose: "主要签名服务"
+      high_availability: true
+    
+    - name: "Backup Signer"
+      location: "备用数据中心"
+      purpose: "故障转移"
+      high_availability: true
+  
+  callback_verifier:
+    location: "独立验证服务"
+    auto_approval_rules:
+      - max_amount: 1000
+        time_window: "1 hour"
+  
+  use_cases:
+    - "高频交易"
+    - "7x24小时服务"
+    - "完全自动化流程"
+```
+
+#### 8.2.3 Client Signer部署步骤
+
+**步骤1：生成Ed25519密钥对**
+
+```bash
+# 生成密钥对
+ssh-keygen -t ed25519 -C "client_signer_production"
+# 不要设置密码
+# 保存私钥到安全位置
+```
+
+**步骤2：创建Client Signer**
+
+```go
+// Client Signer配置
+type ClientSignerConfig struct {
+    Name       string   // 唯一标识
+    PublicKey  string   // Ed25519公钥
+    IPWhitelist []string // IP白名单（最多3个）
+    VaultID    string   // 所属Vault
+}
+```
+
+**步骤3：配置密钥访问**
+
+```yaml
+# 密钥访问配置
+key_access:
+  client_signer_id: "cs-123456"
+  key_shares:
+    - key_id: "key-abc123"
+      access_level: "read_write"
+    - key_id: "key-def456"
+      access_level: "read_only"
+  
+  approval_required: true
+  auto_approval:
+    enabled: false
+    max_amount: 0
+```
+
+**步骤4：部署Client Signer服务**
+
+```go
+// Client Signer服务实现
+package main
+
+import (
+    "context"
+    "crypto/ed25519"
+    "encoding/hex"
+    "log"
+    "os"
+    
+    "github.com/your-org/mpc-wallet/internal/mpc/client"
+)
+
+func main() {
+    // 1. 加载私钥
+    privateKeyBytes, err := os.ReadFile("client_signer_private_key")
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    privateKey := ed25519.PrivateKey(privateKeyBytes)
+    
+    // 2. 初始化Client Signer
+    signer, err := client.NewClientSigner(
+        client.WithPrivateKey(privateKey),
+        client.WithServerURL("https://mpc.example.com"),
+        client.WithVaultID("vault-123"),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // 3. 启动服务
+    ctx := context.Background()
+    if err := signer.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
+    
+    // 4. 处理签名请求
+    signer.HandleSigningRequests(func(req *SigningRequest) error {
+        // 验证请求
+        if err := validateRequest(req); err != nil {
+            return err
+        }
+        
+        // 参与MPC签名
+        return signer.ParticipateInMPC(req.SessionID)
+    })
+}
+```
+
+### 8.3 个人使用场景
+
+#### 8.3.1 场景描述
+
+个人用户使用MPC钱包进行日常数字资产管理，包括：
+- 个人资产存储和转账
+- DeFi协议交互
+- NFT交易
+- 多链资产管理
+
+#### 8.3.2 架构设计
+
+```mermaid
+graph TB
+    subgraph "个人用户环境"
+        A[移动APP<br/>iOS/Android]
+        B[云端代理<br/>可选]
+    end
+    
+    subgraph "MPC网络"
+        C[Coordinator]
+        D[Participant节点1]
+        E[Participant节点2]
+        F[Participant节点3]
+    end
+    
+    A -->|1. 发起签名请求| C
+    C -->|2. 通知| B
+    B -->|3. 参与MPC| C
+    C -->|4. 协调| D
+    C -->|5. 协调| E
+    C -->|6. 协调| F
+    D -->|7. MPC计算| C
+    E -->|7. MPC计算| C
+    F -->|7. MPC计算| C
+    C -->|8. 返回签名| A
+```
+
+#### 8.3.3 密钥分片分配
+
+**个人用户模式（3-of-3）**：
+
+```
+密钥分片分配：
+├── 用户设备：持有1个分片
+│   ├── 存储在Secure Enclave/TrustZone
+│   ├── 生物认证保护
+│   └── 设备绑定
+├── 云端代理1：持有1个分片
+│   ├── 加密存储
+│   ├── 多区域备份
+│   └── TEE保护
+└── 云端代理2：持有1个分片
+    ├── 加密存储
+    ├── 多区域备份
+    └── TEE保护
+```
+
+#### 8.3.4 使用流程
+
+**流程1：创建钱包**
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant APP as 移动APP
+    participant Server as MPC服务器
+    participant Nodes as MPC节点
+
+    User->>APP: 1. 创建钱包
+    APP->>Server: 2. 发起DKG请求
+    Server->>Nodes: 3. 启动DKG协议
+    Nodes->>Nodes: 4. 执行DKG
+    Nodes->>Server: 5. 返回公钥
+    Server->>APP: 6. 返回钱包地址
+    APP->>User: 7. 显示钱包信息
+```
+
+**流程2：发起转账**
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant APP as 移动APP
+    participant Proxy as 云端代理
+    participant Server as MPC服务器
+    participant Nodes as MPC节点
+
+    User->>APP: 1. 输入转账信息
+    APP->>APP: 2. 生物认证
+    APP->>Server: 3. 创建签名请求
+    Server->>Proxy: 4. 通知参与签名
+    Server->>APP: 5. 推送通知
+    APP->>APP: 6. 用户确认
+    APP->>Server: 7. 批准请求
+    Proxy->>Server: 8. 参与MPC
+    Server->>Nodes: 9. 执行MPC签名
+    Nodes-->>Server: 10. 返回签名
+    Server->>APP: 11. 返回签名结果
+    APP->>User: 12. 显示交易状态
+```
+
+#### 8.3.5 安全特性
+
+**个人用户安全措施**：
+
+```yaml
+personal_user_security:
+  device_protection:
+    - "Secure Enclave/TrustZone存储"
+    - "生物认证（FaceID/TouchID/指纹）"
+    - "设备绑定"
+    - "PIN码保护"
+  
+  cloud_proxy_protection:
+    - "TEE环境运行"
+    - "端到端加密"
+    - "多区域备份"
+    - "访问审计"
+  
+  network_protection:
+    - "TLS 1.3加密"
+    - "证书钉扎"
+    - "防重放攻击"
+    - "请求签名"
+```
+
+#### 8.3.6 备份恢复
+
+**个人用户备份方案**：
+
+```mermaid
+graph TB
+    A[用户设备分片] -->|Ed25519公钥加密| B[备份包1]
+    C[云端代理分片1] -->|Ed25519公钥加密| B
+    D[云端代理分片2] -->|Ed25519公钥加密| B
+    
+    B -->|SSS分片| E[备份分片1]
+    B -->|SSS分片| F[备份分片2]
+    B -->|SSS分片| G[备份分片3]
+    
+    E -->|存储| H[安全位置1]
+    F -->|存储| I[安全位置2]
+    G -->|存储| J[安全位置3]
+```
+
+**恢复流程**：
+
+```go
+// 个人用户恢复示例
+func RecoverPersonalWallet(backupShares []BackupShare, privateKeys []ed25519.PrivateKey) (*Wallet, error) {
+    // 1. 使用SSS恢复加密备份包
+    encryptedBackup := shamir.Combine(backupShares)
+    
+    // 2. 使用Ed25519私钥解密
+    decryptedShares := make([]KeyShare, 0)
+    for i, encryptedShare := range encryptedBackup.Shares {
+        share, err := decryptWithPrivateKey(encryptedShare, privateKeys[i])
+        if err != nil {
+            return nil, err
+        }
+        decryptedShares = append(decryptedShares, share)
+    }
+    
+    // 3. 恢复钱包
+    return restoreWallet(decryptedShares)
+}
+```
+
+### 8.4 团队使用场景
+
+#### 8.4.1 场景描述
+
+团队使用MPC钱包进行企业级数字资产管理，包括：
+- 企业资金管理
+- 多签审批流程
+- 批量操作（工资发放、空投）
+- 合规审计
+
+#### 8.4.2 架构设计
+
+```mermaid
+graph TB
+    subgraph "业务系统"
+        A[业务应用]
+        B[Client Signer<br/>可选]
+    end
+    
+    subgraph "团队管理"
+        C[团队成员1<br/>Manager]
+        D[团队成员2<br/>Manager]
+        E[团队成员3<br/>Member]
+    end
+    
+    subgraph "MPC网络"
+        F[Coordinator]
+        G[Participant节点]
+    end
+    
+    A -->|创建签名请求| F
+    B -->|参与MPC| F
+    F -->|通知批准| C
+    F -->|通知批准| D
+    C -->|批准| F
+    D -->|批准| F
+    F -->|执行MPC| G
+    G -->|返回签名| F
+    F -->|返回结果| A
+```
+
+#### 8.4.3 多签策略配置
+
+**策略类型**：
+
+```yaml
+multisig_policies:
+  # 简单模式：统一审批要求
+  simple_mode:
+    approvers_required: 2
+    applies_to: "all_transactions"
+  
+  # 高级模式：基于条件的策略
+  advanced_mode:
+    policies:
+      # 基于金额的策略
+      - name: "小额交易"
+        condition:
+          amount: "< 1000"
+          currency: "USDT"
+        approvers_required: 1
+        
+      - name: "大额交易"
+        condition:
+          amount: ">= 10000"
+          currency: "USDT"
+        approvers_required: 3
+        
+      # 基于地址的策略
+      - name: "白名单地址"
+        condition:
+          destination: "whitelist"
+        approvers_required: 1
+        
+      # 基于类型的策略
+      - name: "消息签名"
+        condition:
+          type: "message_signing"
+        approvers_required: 2
+        
+      - name: "未知金额"
+        condition:
+          type: "unknown_amount"
+        approvers_required: 2
+```
+
+#### 8.4.4 团队角色管理
+
+**角色定义**：
+
+```go
+// 团队角色
+type TeamRole string
+
+const (
+    RoleOwner   TeamRole = "owner"   // 所有者：完全控制
+    RoleManager TeamRole = "manager" // 管理者：可以批准交易和管理成员
+    RoleMember  TeamRole = "member"  // 成员：可以创建交易请求
+)
+
+// 权限矩阵
+var PermissionMatrix = map[TeamRole][]Permission{
+    RoleOwner: {
+        PermissionCreateTransaction,
+        PermissionApproveTransaction,
+        PermissionManageMembers,
+        PermissionManagePolicies,
+        PermissionManageClientSigners,
+        PermissionExportBackup,
+    },
+    RoleManager: {
+        PermissionCreateTransaction,
+        PermissionApproveTransaction,
+        PermissionManageMembers, // 有限权限
+    },
+    RoleMember: {
+        PermissionCreateTransaction,
+    },
+}
+```
+
+#### 8.4.5 审批流程
+
+**审批流程示例**：
+
+```mermaid
+sequenceDiagram
+    participant Member as 团队成员<br/>创建请求
+    participant Server as MPC服务器
+    participant M1 as Manager 1
+    participant M2 as Manager 2
+    participant Signer as Client Signer
+
+    Member->>Server: 1. 创建签名请求<br/>转账1000 USDT
+    Server->>Server: 2. 评估策略<br/>需要2个Manager批准
+    Server->>M1: 3. 推送通知
+    Server->>M2: 4. 推送通知
+    M1->>Server: 5. 批准请求
+    M2->>Server: 6. 批准请求
+    Server->>Server: 7. 达到阈值<br/>启动MPC签名
+    Server->>Signer: 8. 通知参与签名
+    Signer->>Server: 9. 参与MPC计算
+    Server->>Server: 10. 完成签名
+    Server->>Member: 11. 返回交易结果
+```
+
+#### 8.4.6 批量操作支持
+
+**批量工资发放示例**：
+
+```go
+// 批量操作
+type BatchOperation struct {
+    OperationID string
+    Type        BatchType // PAYROLL, AIRDROP, etc.
+    Items       []BatchItem
+    Policy      *MultisigPolicy
+}
+
+type BatchItem struct {
+    Address string
+    Amount  *big.Int
+    Token   string
+    Memo    string
+}
+
+// 批量处理流程
+func ProcessBatchOperation(ctx context.Context, batch *BatchOperation) error {
+    // 1. 创建批量签名请求
+    signingRequests := make([]*SigningRequest, 0)
+    for _, item := range batch.Items {
+        req := &SigningRequest{
+            KeyID:      batch.KeyID,
+            Message:    buildTransaction(item),
+            MessageType: MessageTypeTransaction,
+        }
+        signingRequests = append(signingRequests, req)
+    }
+    
+    // 2. 批量提交（需要团队批准）
+    for _, req := range signingRequests {
+        if err := submitSigningRequest(ctx, req); err != nil {
+            return err
+        }
+    }
+    
+    // 3. 等待审批
+    // 4. 批量执行签名
+    return executeBatchSigning(ctx, signingRequests)
+}
+```
+
+### 8.5 混合使用场景
+
+#### 8.5.1 场景描述
+
+混合场景结合个人和团队使用，包括：
+- 个人钱包 + 团队钱包
+- 跨钱包转账
+- 共享账户管理
+- 权限继承
+
+#### 8.5.2 架构设计
+
+```mermaid
+graph TB
+    subgraph "个人钱包"
+        A[个人APP]
+        B[个人云端代理]
+    end
+    
+    subgraph "团队钱包"
+        C[业务系统]
+        D[Client Signer]
+        E[团队成员]
+    end
+    
+    subgraph "MPC网络"
+        F[Coordinator]
+        G[Participant节点]
+    end
+    
+    A -->|个人交易| F
+    B -->|参与MPC| F
+    C -->|团队交易| F
+    D -->|参与MPC| F
+    E -->|批准| F
+    F -->|协调| G
+```
+
+#### 8.5.3 跨钱包操作
+
+**个人钱包向团队钱包转账**：
+
+```go
+// 跨钱包转账
+func TransferFromPersonalToTeam(
+    ctx context.Context,
+    personalWallet *PersonalWallet,
+    teamWallet *TeamWallet,
+    amount *big.Int,
+) error {
+    // 1. 从个人钱包创建转账交易
+    tx, err := personalWallet.CreateTransaction(ctx, &TransactionRequest{
+        To:    teamWallet.Address,
+        Amount: amount,
+        Token: "USDT",
+    })
+    if err != nil {
+        return err
+    }
+    
+    // 2. 个人钱包签名（需要个人批准）
+    signature, err := personalWallet.Sign(ctx, tx)
+    if err != nil {
+        return err
+    }
+    
+    // 3. 提交到区块链
+    return submitTransaction(ctx, tx, signature)
+}
+```
+
+### 8.6 部署建议总结
+
+#### 8.6.1 个人用户部署建议
+
+| 场景 | 推荐方案 | Client Signer | 云端代理 | 说明 |
+|------|---------|---------------|----------|------|
+| **日常使用** | 轻量级客户端 | ❌ 不需要 | ✅ 必需 | APP仅负责认证和批准 |
+| **高安全需求** | 分离式架构 | ✅ 可选 | ✅ 必需 | 验证和签名分离 |
+| **企业内网** | 完全本地参与 | ✅ 必需 | ❌ 不需要 | 设备直接参与MPC |
+
+#### 8.6.2 团队用户部署建议
+
+| 场景 | 推荐方案 | Client Signer | 团队成员 | 说明 |
+|------|---------|---------------|----------|------|
+| **小团队（<10人）** | 纯手动批准 | ❌ 不需要 | ✅ App批准 | 简单易用 |
+| **企业级（推荐）** | 混合模式 | ✅ 业务系统部署 | ✅ App批准 | 自动化+人工审核 |
+| **高频交易** | 完全程序化 | ✅ 多个部署 | ✅ 可选 | 7x24小时服务 |
+
+#### 8.6.3 实施优先级
+
+**Phase 1（MVP）**：
+1. ✅ 轻量级客户端模式（个人用户）
+2. ✅ 纯手动批准（小团队）
+3. ✅ 基础多签策略
+
+**Phase 2（增强）**：
+1. ⚠️ 分离式架构（高安全场景）
+2. ⚠️ Client Signer部署（企业级）
+3. ⚠️ 高级多签策略
+
+**Phase 3（高级）**：
+1. ⏳ 完全程序化（高频交易）
+2. ⏳ 跨钱包操作
+3. ⏳ 权限继承
+
+---
+
+## 9. 性能优化设计
 
 ### 8.1 签名性能优化
 
@@ -2166,14 +3207,35 @@ data:
 
 ---
 
-**文档版本**: v2.2
+**文档版本**: v2.3
 **最后更新**: 2025-01-02
 **维护团队**: MPC 开发团队
-**文档状态**: 详细设计完成，已集成技术方案文档更新
+**文档状态**: 详细设计完成，已添加客户端集成和使用场景详解
 
 ---
 
 ## 更新日志
+
+### 2025-01-02 - 客户端集成与使用场景详解
+
+**新增内容**：
+- ✅ 添加移动APP集成方案：轻量级客户端、分离式架构、完全本地参与三种模式
+- ✅ 添加iOS/Android实现示例代码
+- ✅ 添加Client Signer部署策略：纯手动批准、混合模式、完全程序化三种场景
+- ✅ 添加个人使用场景：个人钱包创建、转账流程、备份恢复
+- ✅ 添加团队使用场景：多签策略配置、角色管理、审批流程、批量操作
+- ✅ 添加混合使用场景：跨钱包操作、权限继承
+- ✅ 添加详细的部署建议和实施优先级
+
+**关键问题解答**：
+- ✅ 明确回答"团队签名是否需要每个参与方部署Client Signer"：不是必须的，取决于场景
+- ✅ 详细说明移动APP在MPC架构中的角色和集成方案
+- ✅ 提供个人用户和团队用户的不同部署策略
+
+**技术细节**：
+- ✅ 提供完整的代码示例（Swift、Kotlin、Go）
+- ✅ 详细的架构图和流程图
+- ✅ 配置示例和部署指南
 
 ### 2025-01-02 - 技术方案文档集成更新
 
