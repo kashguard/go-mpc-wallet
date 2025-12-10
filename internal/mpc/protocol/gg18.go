@@ -33,9 +33,6 @@ type GG18Protocol struct {
 	mu         sync.RWMutex
 	keyRecords map[string]*gg18KeyRecord
 
-	roundMu     sync.Mutex
-	roundStates map[string]*signingRoundState
-
 	// tss-lib 管理器
 	partyManager *tssPartyManager
 
@@ -43,28 +40,16 @@ type GG18Protocol struct {
 	thisNodeID string
 
 	// 消息路由函数（用于节点间通信）
-	// 参数：sessionID（用于DKG或签名会话），nodeID（目标节点），msg（tss-lib消息）
-	messageRouter func(sessionID string, nodeID string, msg tss.Message) error
-}
-
-// signingRoundState 签名轮次状态（用于跟踪协议进度）
-type signingRoundState struct {
-	SessionID      string
-	TotalRounds    int
-	CurrentRound   int
-	LastUpdated    time.Time
-	NodeIDs        []string
-	LastMessage    string
-	RoundDurations []time.Duration
+	// 参数：sessionID（用于DKG或签名会话），nodeID（目标节点），msg（tss-lib消息），isBroadcast（是否广播）
+	messageRouter func(sessionID string, nodeID string, msg tss.Message, isBroadcast bool) error
 }
 
 // NewGG18Protocol 创建GG18协议实例（生产级实现，基于 tss-lib）
-func NewGG18Protocol(curve string, thisNodeID string, messageRouter func(sessionID string, nodeID string, msg tss.Message) error) *GG18Protocol {
+func NewGG18Protocol(curve string, thisNodeID string, messageRouter func(sessionID string, nodeID string, msg tss.Message, isBroadcast bool) error) *GG18Protocol {
 	partyManager := newTSSPartyManager(messageRouter)
 	return &GG18Protocol{
 		curve:         curve,
 		keyRecords:    make(map[string]*gg18KeyRecord),
-		roundStates:   make(map[string]*signingRoundState),
 		partyManager:  partyManager,
 		thisNodeID:    thisNodeID,
 		messageRouter: messageRouter,
@@ -260,23 +245,8 @@ func (p *GG18Protocol) RotateKey(ctx context.Context, keyID string) error {
 }
 
 // ProcessIncomingKeygenMessage 处理接收到的DKG消息
-func (p *GG18Protocol) ProcessIncomingKeygenMessage(ctx context.Context, sessionID string, fromNodeID string, msgBytes []byte) error {
-	// 检查是否已经有活跃的keygen实例
-	p.partyManager.mu.RLock()
-	_, hasActiveKeygen := p.partyManager.activeKeygen[sessionID]
-	p.partyManager.mu.RUnlock()
-	
-	// 如果没有活跃实例，说明这是第一个消息，需要先启动DKG协议
-	// 但是，启动DKG需要节点列表等信息，这些信息应该从会话中获取
-	// 由于ProcessIncomingKeygenMessage没有访问会话的权限，我们暂时只处理消息
-	// 启动DKG的逻辑应该在handleProtocolMessage中完成
-	if !hasActiveKeygen {
-		// 记录警告：收到DKG消息但没有活跃的keygen实例
-		// 这通常意味着参与者节点还没有启动DKG协议
-		// 消息会被放入队列，等待DKG协议启动后处理
-	}
-	
-	return p.partyManager.ProcessIncomingKeygenMessage(ctx, sessionID, fromNodeID, msgBytes)
+func (p *GG18Protocol) ProcessIncomingKeygenMessage(ctx context.Context, sessionID string, fromNodeID string, msgBytes []byte, isBroadcast bool) error {
+	return p.partyManager.ProcessIncomingKeygenMessage(ctx, sessionID, fromNodeID, msgBytes, isBroadcast)
 }
 
 // ProcessIncomingSigningMessage 处理接收到的签名消息

@@ -155,7 +155,7 @@ func NewProtocolEngine(cfg config.Server, grpcClient *mpcgrpc.GRPCClient) protoc
 
 	// 使用真正的gRPC客户端作为消息路由器
 	// 参数：sessionID（用于DKG或签名会话），nodeID（目标节点），msg（tss-lib消息）
-	messageRouter := func(sessionID string, nodeID string, msg tss.Message) error {
+	messageRouter := func(sessionID string, nodeID string, msg tss.Message, isBroadcast bool) error {
 		ctx := context.Background()
 		// 根据会话ID判断消息类型（DKG或签名）
 		// 如果sessionID是keyID格式（以"key-"开头），则作为DKG消息处理
@@ -167,7 +167,7 @@ func NewProtocolEngine(cfg config.Server, grpcClient *mpcgrpc.GRPCClient) protoc
 				Str("target_node_id", nodeID).
 				Str("this_node_id", thisNodeID).
 				Msg("Routing DKG message to target node")
-			err := grpcClient.SendKeygenMessage(ctx, nodeID, msg, sessionID)
+			err := grpcClient.SendKeygenMessage(ctx, nodeID, msg, sessionID, isBroadcast)
 			if err != nil {
 				log.Error().
 					Err(err).
@@ -251,20 +251,13 @@ func NewSigningServiceProvider(keyService *key.Service, protocolEngine protocol.
 
 func NewCoordinatorServiceProvider(
 	cfg config.Server,
-	metadataStore storage.MetadataStore,
 	keyService *key.Service,
-	signingService *signing.Service,
 	sessionManager *session.Manager,
-	nodeManager *node.Manager,
 	nodeDiscovery *node.Discovery,
 	protocolEngine protocol.Engine,
 	grpcClient *mpcgrpc.GRPCClient,
 ) *coordinator.Service {
-	// coordinator.Service 需要 GRPCClient 接口，但 mpcgrpc.GRPCClient 实现了该接口
-	// 这里需要进行类型转换或适配
-	// 由于 coordinator.GRPCClient 接口只定义了 SendKeygenMessage 方法
-	// 而 mpcgrpc.GRPCClient 已经实现了该方法，可以直接传递
-
+	// coordinator.Service 需要 GRPCClient 接口，mpcgrpc.GRPCClient 实现了该接口
 	// 记录配置的 NodeID（用于调试）
 	nodeID := cfg.MPC.NodeID
 	log.Error().
@@ -273,7 +266,7 @@ func NewCoordinatorServiceProvider(
 		Str("mpc_node_type", cfg.MPC.NodeType).
 		Msg("NewCoordinatorServiceProvider: creating coordinator service with NodeID")
 
-	return coordinator.NewService(metadataStore, keyService, signingService, sessionManager, nodeManager, nodeDiscovery, protocolEngine, grpcClient, nodeID)
+	return coordinator.NewService(keyService, sessionManager, nodeDiscovery, protocolEngine, grpcClient, nodeID)
 }
 
 func NewParticipantServiceProvider(cfg config.Server, keyShareStorage storage.KeyShareStorage, protocolEngine protocol.Engine) *participant.Service {

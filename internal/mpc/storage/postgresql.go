@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -479,12 +480,12 @@ func (s *PostgreSQLStore) SaveSigningSession(ctx context.Context, session *Signi
 	var keyExists bool
 	checkQuery := `SELECT EXISTS(SELECT 1 FROM keys WHERE key_id = $1)`
 	if err := s.db.QueryRowContext(ctx, checkQuery, session.KeyID).Scan(&keyExists); err != nil {
-		// 如果查询失败，记录错误但继续尝试插入（让数据库外键约束来处理）
-		// 这样可以获得更详细的错误信息
+		// 如果查询失败，返回更详细的错误信息
+		return errors.Wrapf(err, "failed to check if key_id %s exists in keys table", session.KeyID)
 	}
 	if !keyExists {
-		// 记录详细的错误信息
-		return errors.Errorf("key_id %s does not exist in keys table, cannot create signing session. This usually means the placeholder key was not created successfully.", session.KeyID)
+		// 记录详细的错误信息，包括可能的根因
+		return errors.Errorf("key_id %s does not exist in keys table, cannot create signing session. This usually means: 1) the placeholder key was not created successfully, 2) the key was created in a different transaction that hasn't committed yet, or 3) there's a database connection/transaction isolation issue", session.KeyID)
 	}
 
 	_, err = s.db.ExecContext(ctx, query,
@@ -494,7 +495,17 @@ func (s *PostgreSQLStore) SaveSigningSession(ctx context.Context, session *Signi
 		session.CreatedAt, completedAt, session.DurationMs,
 	)
 	if err != nil {
-		return errors.Wrap(err, "failed to save signing session")
+		// 检查是否是外键约束错误
+		errStr := err.Error()
+		if strings.Contains(errStr, "foreign key") || strings.Contains(errStr, "violates foreign key constraint") {
+			return errors.Wrapf(err, "failed to save signing session: foreign key constraint violation - key_id %s does not exist in keys table", session.KeyID)
+		}
+		// 检查是否是唯一约束错误
+		if strings.Contains(errStr, "unique constraint") || strings.Contains(errStr, "duplicate key") {
+			return errors.Wrapf(err, "failed to save signing session: unique constraint violation - session_id %s already exists", session.SessionID)
+		}
+		// 其他数据库错误
+		return errors.Wrapf(err, "failed to save signing session (session_id: %s, key_id: %s)", session.SessionID, session.KeyID)
 	}
 
 	return nil

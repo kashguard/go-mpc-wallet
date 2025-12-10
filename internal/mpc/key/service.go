@@ -165,15 +165,28 @@ func (s *Service) CreatePlaceholderKey(ctx context.Context, req *CreateKeyReques
 	}
 
 	if err := s.metadataStore.SaveKeyMetadata(ctx, storageKey); err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Msg("Failed to save placeholder key metadata to database")
 		return nil, errors.Wrap(err, "failed to save placeholder key metadata")
 	}
 
-	// 使用 log 包记录成功创建占位符密钥
-	log.Error().
+	// 立即验证密钥是否真的保存了
+	savedKey, err := s.metadataStore.GetKeyMetadata(ctx, keyID)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Msg("Key saved but cannot be retrieved - verification failed")
+		return nil, errors.Wrap(err, "key saved but verification failed")
+	}
+
+	log.Info().
 		Str("key_id", keyID).
-		Str("status", keyMetadata.Status).
-		Str("public_key", keyMetadata.PublicKey).
-		Msg("Placeholder key saved to database successfully")
+		Str("status", savedKey.Status).
+		Str("public_key", savedKey.PublicKey).
+		Msg("Placeholder key saved and verified successfully")
 
 	return keyMetadata, nil
 }

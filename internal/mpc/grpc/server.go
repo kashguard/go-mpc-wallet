@@ -205,6 +205,17 @@ func (s *GRPCServer) JoinSigningSession(stream grpc.BidiStreamingServer[pb.Sessi
 
 // StartDKG 由协调者调用以启动参与者的 DKG
 func (s *GRPCServer) StartDKG(ctx context.Context, req *pb.StartDKGRequest) (*pb.StartDKGResponse, error) {
+	log.Info().
+		Str("key_id", req.KeyId).
+		Str("session_id", req.SessionId).
+		Str("algorithm", req.Algorithm).
+		Str("curve", req.Curve).
+		Int32("threshold", req.Threshold).
+		Int32("total_nodes", req.TotalNodes).
+		Strs("node_ids", req.NodeIds).
+		Str("this_node_id", s.nodeID).
+		Msg("StartDKG RPC received")
+
 	dkgReq := &protocol.KeyGenRequest{
 		KeyID:      req.KeyId,
 		Algorithm:  req.Algorithm,
@@ -214,13 +225,39 @@ func (s *GRPCServer) StartDKG(ctx context.Context, req *pb.StartDKGRequest) (*pb
 		NodeIDs:    req.NodeIds,
 	}
 
+	log.Info().
+		Str("key_id", req.KeyId).
+		Str("this_node_id", s.nodeID).
+		Msg("Calling protocolEngine.GenerateKeyShare (this may take several minutes)")
+
 	resp, err := s.protocolEngine.GenerateKeyShare(ctx, dkgReq)
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", req.KeyId).
+			Str("this_node_id", s.nodeID).
+			Msg("GenerateKeyShare failed")
 		return &pb.StartDKGResponse{Started: false, Message: err.Error()}, nil
 	}
 
+	log.Info().
+		Str("key_id", req.KeyId).
+		Str("this_node_id", s.nodeID).
+		Str("public_key", resp.PublicKey.Hex).
+		Msg("GenerateKeyShare completed successfully")
+
 	if resp != nil && resp.PublicKey != nil && resp.PublicKey.Hex != "" {
-		_ = s.sessionManager.CompleteKeygenSession(ctx, req.KeyId, resp.PublicKey.Hex)
+		if err := s.sessionManager.CompleteKeygenSession(ctx, req.KeyId, resp.PublicKey.Hex); err != nil {
+			log.Error().
+				Err(err).
+				Str("key_id", req.KeyId).
+				Msg("Failed to complete keygen session")
+		} else {
+			log.Info().
+				Str("key_id", req.KeyId).
+				Str("public_key", resp.PublicKey.Hex).
+				Msg("Keygen session completed successfully")
+		}
 	}
 
 	return &pb.StartDKGResponse{Started: true, Message: "DKG started"}, nil
@@ -231,14 +268,26 @@ func (s *GRPCServer) handleProtocolMessage(ctx context.Context, sessionID string
 	// 从会话中判断消息类型
 	sess, err := s.sessionManager.GetSession(ctx, sessionID)
 	if err != nil {
-		return errors.Wrap(err, "failed to get session")
+		log.Error().
+			Err(err).
+			Str("session_id", sessionID).
+			Str("from_node_id", fromNodeID).
+			Str("this_node_id", s.nodeID).
+			Msg("Failed to get session for protocol message - participant cannot start DKG without session")
+		// 提供更详细的错误信息，帮助诊断问题
+		return errors.Wrapf(err, "failed to get session %s for protocol message from node %s (this node: %s). Possible causes: 1) session was not created by coordinator, 2) session was created but not yet visible due to database replication lag, 3) session expired or was deleted", sessionID, fromNodeID, s.nodeID)
 	}
 
 	// 根据协议类型判断是DKG还是签名
-	// 根据会话的Protocol字段判断消息类型
-	// 如果Protocol包含"keygen"或"DKG"，则作为DKG消息处理
-	// 否则作为签名消息处理
-	if sess.Protocol == "keygen" || sess.Protocol == "dkg" {
+	// gg18/gg20/frost 属于 DKG/Keygen 协议，需要走 DKG 分支
+	protocolLower := strings.ToLower(sess.Protocol)
+	isDKG := protocolLower == "keygen" ||
+		protocolLower == "dkg" ||
+		strings.HasPrefix(protocolLower, "gg") || // gg18 / gg20
+		protocolLower == "frost"
+	isBroadcast := shareMsg != nil && shareMsg.Round == -1
+
+	if isDKG {
 		// 处理特殊控制消息
 		if len(shareMsg.ShareData) > 0 {
 			data := string(shareMsg.ShareData)
@@ -277,6 +326,21 @@ func (s *GRPCServer) handleProtocolMessage(ctx context.Context, sessionID string
 			once.Do(func() {
 				// 在后台启动DKG协议，不阻塞消息处理
 				go func() {
+					// 使用独立的上下文，避免 gRPC 请求结束导致 context 被取消
+					keygenTimeout := 10 * time.Minute
+					keygenCtx, cancel := context.WithTimeout(context.Background(), keygenTimeout)
+					defer cancel()
+
+					log.Info().
+						Str("session_id", sessionID).
+						Str("key_id", sess.KeyID).
+						Str("this_node_id", s.nodeID).
+						Int("threshold", sess.Threshold).
+						Int("total_nodes", sess.TotalNodes).
+						Strs("participating_nodes", sess.ParticipatingNodes).
+						Dur("keygen_timeout", keygenTimeout).
+						Msg("Auto-starting DKG protocol on participant (triggered by incoming message)")
+
 					// 从会话中获取DKG参数
 					// 注意：Algorithm和Curve需要从密钥元数据中获取，但会话中没有
 					// 暂时使用默认值，后续可以从keyID对应的密钥元数据中获取
@@ -291,10 +355,36 @@ func (s *GRPCServer) handleProtocolMessage(ctx context.Context, sessionID string
 
 					// 启动DKG协议（在后台，不阻塞）
 					// 消息会被放入队列，等待DKG协议启动后处理
-					resp, err := s.protocolEngine.GenerateKeyShare(ctx, dkgReq)
-					if err == nil && resp != nil && resp.PublicKey != nil && resp.PublicKey.Hex != "" {
+					resp, err := s.protocolEngine.GenerateKeyShare(keygenCtx, dkgReq)
+					if err != nil {
+						log.Error().
+							Err(err).
+							Str("session_id", sessionID).
+							Str("key_id", sess.KeyID).
+							Str("this_node_id", s.nodeID).
+							Msg("DKG protocol failed on participant")
+					} else if resp != nil && resp.PublicKey != nil && resp.PublicKey.Hex != "" {
+						log.Info().
+							Str("session_id", sessionID).
+							Str("key_id", sess.KeyID).
+							Str("this_node_id", s.nodeID).
+							Str("public_key", resp.PublicKey.Hex).
+							Msg("DKG protocol completed successfully on participant, calling CompleteKeygenSession")
 						// DKG 完成，直接更新会话与密钥（共享数据库）
-						_ = s.sessionManager.CompleteKeygenSession(ctx, sess.KeyID, resp.PublicKey.Hex)
+						if err := s.sessionManager.CompleteKeygenSession(ctx, sess.KeyID, resp.PublicKey.Hex); err != nil {
+							log.Error().
+								Err(err).
+								Str("session_id", sessionID).
+								Str("key_id", sess.KeyID).
+								Str("this_node_id", s.nodeID).
+								Msg("Failed to complete keygen session")
+						} else {
+							log.Info().
+								Str("session_id", sessionID).
+								Str("key_id", sess.KeyID).
+								Str("this_node_id", s.nodeID).
+								Msg("Keygen session completed successfully")
+						}
 					}
 				}()
 			})
@@ -302,7 +392,7 @@ func (s *GRPCServer) handleProtocolMessage(ctx context.Context, sessionID string
 
 		// 作为DKG消息处理，传递发送方节点ID
 		// 消息会被放入队列，等待DKG协议启动后处理
-		if err := s.protocolEngine.ProcessIncomingKeygenMessage(ctx, sessionID, fromNodeID, shareMsg.ShareData); err != nil {
+		if err := s.protocolEngine.ProcessIncomingKeygenMessage(ctx, sessionID, fromNodeID, shareMsg.ShareData, isBroadcast); err != nil {
 			return errors.Wrap(err, "failed to process keygen message")
 		}
 	} else {

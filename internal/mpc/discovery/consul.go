@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/hashicorp/consul/api"
 	"github.com/rs/zerolog/log"
@@ -76,6 +77,16 @@ func (c *ConsulClient) Register(ctx context.Context, service *ServiceInfo) error
 // Deregister 从 Consul 注销服务
 func (c *ConsulClient) Deregister(ctx context.Context, serviceID string) error {
 	if err := c.client.Agent().ServiceDeregister(serviceID); err != nil {
+		// 如果服务不存在（404错误），只记录警告而不是错误
+		// 这通常发生在服务从未成功注册，或已被 Consul 自动注销的情况下
+		errStr := err.Error()
+		if strings.Contains(errStr, "404") || strings.Contains(errStr, "Unknown service ID") {
+			log.Warn().
+				Str("service_id", serviceID).
+				Err(err).
+				Msg("Service not found in Consul, skipping deregistration")
+			return nil
+		}
 		return fmt.Errorf("failed to deregister service: %w", err)
 	}
 

@@ -2,27 +2,22 @@ package coordinator
 
 import (
 	"context"
-	"encoding/hex"
+	"sort"
+	"time"
 
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/key"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/node"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/protocol"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/session"
-	"github.com/kashguard/go-mpc-wallet/internal/mpc/signing"
-	"github.com/kashguard/go-mpc-wallet/internal/mpc/storage"
 	pb "github.com/kashguard/go-mpc-wallet/internal/pb/mpc/v1"
-	"github.com/kashguard/tss-lib/tss"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog/log"
 )
 
 // Service Coordinator服务
 type Service struct {
-	metadataStore  storage.MetadataStore
 	keyService     *key.Service
-	signingService *signing.Service
 	sessionManager *session.Manager
-	nodeManager    *node.Manager
 	nodeDiscovery  *node.Discovery
 	protocolEngine protocol.Engine
 	grpcClient     GRPCClient // gRPC客户端，用于通知参与者
@@ -31,18 +26,14 @@ type Service struct {
 
 // GRPCClient gRPC客户端接口（用于通知参与者）
 type GRPCClient interface {
-	SendKeygenMessage(ctx context.Context, nodeID string, msg tss.Message, sessionID string) error
 	// StartDKG RPC
 	SendStartDKG(ctx context.Context, nodeID string, req *pb.StartDKGRequest) (*pb.StartDKGResponse, error)
 }
 
 // NewService 创建Coordinator服务
 func NewService(
-	metadataStore storage.MetadataStore,
 	keyService *key.Service,
-	signingService *signing.Service,
 	sessionManager *session.Manager,
-	nodeManager *node.Manager,
 	nodeDiscovery *node.Discovery,
 	protocolEngine protocol.Engine,
 	grpcClient GRPCClient,
@@ -55,11 +46,8 @@ func NewService(
 		Msg("CoordinatorService initialized with thisNodeID")
 
 	return &Service{
-		metadataStore:  metadataStore,
 		keyService:     keyService,
-		signingService: signingService,
 		sessionManager: sessionManager,
-		nodeManager:    nodeManager,
 		nodeDiscovery:  nodeDiscovery,
 		protocolEngine: protocolEngine,
 		grpcClient:     grpcClient,
@@ -102,69 +90,6 @@ func (s *Service) CreateSigningSession(ctx context.Context, req *CreateSessionRe
 		CompletedAt:        session.CompletedAt,
 		DurationMs:         session.DurationMs,
 		ExpiresAt:          session.ExpiresAt,
-	}, nil
-}
-
-// JoinSigningSession 节点加入签名会话
-func (s *Service) JoinSigningSession(ctx context.Context, sessionID string, nodeID string) error {
-	if err := s.sessionManager.JoinSession(ctx, sessionID, nodeID); err != nil {
-		return errors.Wrap(err, "failed to join session")
-	}
-	return nil
-}
-
-// GetSigningSession 获取签名会话
-func (s *Service) GetSigningSession(ctx context.Context, sessionID string) (*SigningSession, error) {
-	session, err := s.sessionManager.GetSession(ctx, sessionID)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get session")
-	}
-
-	return &SigningSession{
-		SessionID:          session.SessionID,
-		KeyID:              session.KeyID,
-		Protocol:           session.Protocol,
-		Status:             session.Status,
-		Threshold:          session.Threshold,
-		TotalNodes:         session.TotalNodes,
-		ParticipatingNodes: session.ParticipatingNodes,
-		CurrentRound:       session.CurrentRound,
-		TotalRounds:        session.TotalRounds,
-		Signature:          session.Signature,
-		CreatedAt:          session.CreatedAt,
-		CompletedAt:        session.CompletedAt,
-		DurationMs:         session.DurationMs,
-		ExpiresAt:          session.ExpiresAt,
-	}, nil
-}
-
-// AggregateSignatures 聚合签名分片
-// Deprecated: 在tss-lib分布式签名方案中，签名聚合由tss-lib自动完成
-// 每个节点都能得到完整签名，不需要Coordinator聚合
-// 此方法保留用于向后兼容，但不应被使用
-func (s *Service) AggregateSignatures(ctx context.Context, sessionID string) (*Signature, error) {
-	// 在tss-lib分布式签名方案中，签名聚合由tss-lib自动完成
-	// 每个节点都能得到完整签名，不需要Coordinator聚合
-	// 如果需要获取签名，应该从会话中获取，而不是聚合
-	session, err := s.sessionManager.GetSession(ctx, sessionID)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get session")
-	}
-
-	if session.Signature == "" {
-		return nil, errors.New("signature not yet available in session")
-	}
-
-	// 解析签名
-	sigBytes, err := hex.DecodeString(session.Signature)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to decode signature")
-	}
-
-	// 简化的签名结构（实际应该根据协议类型解析）
-	return &Signature{
-		Bytes: sigBytes,
-		Hex:   session.Signature,
 	}, nil
 }
 
@@ -214,12 +139,14 @@ func (s *Service) CreateDKGSession(ctx context.Context, req *CreateDKGSessionReq
 		for _, n := range participants {
 			nodeIDs = append(nodeIDs, n.NodeID)
 		}
+		// 确保节点列表有序，避免 PartyID 映射不一致
+		sort.Strings(nodeIDs)
 
 		log.Info().
 			Strs("participant_node_ids", nodeIDs).
 			Int("total_participants", len(nodeIDs)).
 			Str("coordinator_node_id", s.thisNodeID).
-			Msg("Final participant node IDs for DKG session (coordinator does NOT participate)")
+			Msg("Final participant node IDs for DKG session (coordinator does NOT participate, sorted)")
 	}
 
 	// 2. 选择协议
@@ -293,6 +220,8 @@ func (s *Service) NotifyParticipantsForDKG(ctx context.Context, req *CreateDKGSe
 		Msg("Notifying leader participant to start DKG protocol")
 
 	// 通过 gRPC 发送 StartDKG RPC 给 leader
+	// 使用独立的 context 和超时，避免受 HTTP 请求超时影响
+	// DKG 可能需要较长时间（几分钟），设置 5 分钟超时
 	startReq := &pb.StartDKGRequest{
 		SessionId:  req.KeyID,
 		KeyId:      req.KeyID,
@@ -303,19 +232,38 @@ func (s *Service) NotifyParticipantsForDKG(ctx context.Context, req *CreateDKGSe
 		NodeIds:    nodeIDs,
 	}
 
-	if _, err := s.grpcClient.SendStartDKG(ctx, leaderNodeID, startReq); err != nil {
-		log.Error().
-			Err(err).
-			Str("key_id", req.KeyID).
-			Str("leader_node_id", leaderNodeID).
-			Msg("Failed to call StartDKG on leader participant")
-		// 不返回错误，让 participant 通过其他方式（如轮询）检测新的 DKG session
-	} else {
+	// 异步调用 StartDKG，避免阻塞 HTTP 请求
+	// 在 goroutine 内部创建 context，确保不会被外部 defer cancel 影响
+	go func() {
+		startDKGTimeout := 5 * time.Minute
+		startDKGCtx, cancel := context.WithTimeout(context.Background(), startDKGTimeout)
+		defer cancel()
+
 		log.Info().
 			Str("key_id", req.KeyID).
 			Str("leader_node_id", leaderNodeID).
-			Msg("StartDKG invoked on leader participant")
-	}
+			Str("timeout", startDKGTimeout.String()).
+			Msg("Starting async StartDKG RPC call")
+
+		resp, err := s.grpcClient.SendStartDKG(startDKGCtx, leaderNodeID, startReq)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("key_id", req.KeyID).
+				Str("leader_node_id", leaderNodeID).
+				Str("timeout", startDKGTimeout.String()).
+				Msg("Failed to call StartDKG on leader participant - participant will auto-start DKG via message routing")
+			// 不返回错误，让 participant 通过其他方式（如消息路由）自动启动 DKG
+			// 即使 StartDKG RPC 失败，participant 在收到协议消息时会自动启动 DKG
+		} else {
+			log.Info().
+				Str("key_id", req.KeyID).
+				Str("leader_node_id", leaderNodeID).
+				Bool("started", resp.Started).
+				Str("message", resp.Message).
+				Msg("StartDKG RPC call succeeded")
+		}
+	}()
 
 	return nil
 }

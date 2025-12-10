@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/kashguard/go-mpc-wallet/internal/mpc/storage"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 )
 
 // Manager 会话管理器
@@ -125,13 +126,68 @@ func (m *Manager) CreateKeyGenSession(ctx context.Context, keyID string, protoco
 		DurationMs:         session.DurationMs,
 	}
 
-	if err := m.metadataStore.SaveSigningSession(ctx, storageSession); err != nil {
-		return nil, errors.Wrap(err, "failed to save keygen session to database")
+	// 添加重试机制，处理可能的数据库连接或事务隔离问题
+	maxRetries := 3
+	retryDelay := 100 * time.Millisecond
+	var saveErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		saveErr = m.metadataStore.SaveSigningSession(ctx, storageSession)
+		if saveErr == nil {
+			// 保存成功，跳出重试循环
+			break
+		}
+		if attempt < maxRetries {
+			log.Warn().
+				Err(saveErr).
+				Str("session_id", session.SessionID).
+				Str("key_id", session.KeyID).
+				Int("attempt", attempt).
+				Int("max_retries", maxRetries).
+				Dur("retry_delay", retryDelay).
+				Msg("Failed to save keygen session, retrying...")
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // 指数退避
+		}
 	}
+	if saveErr != nil {
+		log.Error().
+			Err(saveErr).
+			Str("session_id", session.SessionID).
+			Str("key_id", session.KeyID).
+			Int("attempts", maxRetries).
+			Msg("Failed to save keygen session to database after all retries")
+		return nil, errors.Wrap(saveErr, "failed to save keygen session to database after retries")
+	}
+
+	// 立即验证会话是否真的保存了
+	savedSession, err := m.metadataStore.GetSigningSession(ctx, sessionID)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("session_id", sessionID).
+			Str("key_id", session.KeyID).
+			Msg("Session saved but cannot be retrieved - verification failed")
+		return nil, errors.Wrap(err, "session saved but verification failed")
+	}
+
+	log.Info().
+		Str("session_id", session.SessionID).
+		Str("key_id", session.KeyID).
+		Str("protocol", savedSession.Protocol).
+		Str("status", savedSession.Status).
+		Int("threshold", savedSession.Threshold).
+		Int("total_nodes", savedSession.TotalNodes).
+		Strs("participating_nodes", savedSession.ParticipatingNodes).
+		Msg("Keygen session saved and verified successfully")
 
 	// 保存到Redis缓存
 	if err := m.sessionStore.SaveSession(ctx, storageSession, m.timeout); err != nil {
-		return nil, errors.Wrap(err, "failed to save keygen session to cache")
+		log.Warn().
+			Err(err).
+			Str("session_id", session.SessionID).
+			Str("key_id", session.KeyID).
+			Msg("Failed to save keygen session to cache (non-critical)")
+		// Redis 缓存失败不影响功能，只记录警告
 	}
 
 	return session, nil
@@ -142,14 +198,32 @@ func (m *Manager) GetSession(ctx context.Context, sessionID string) (*Session, e
 	// 先从Redis获取
 	storageSession, err := m.sessionStore.GetSession(ctx, sessionID)
 	if err == nil {
+		log.Debug().
+			Str("session_id", sessionID).
+			Msg("Session retrieved from Redis cache")
 		return convertStorageSession(storageSession), nil
 	}
+	log.Debug().
+		Err(err).
+		Str("session_id", sessionID).
+		Msg("Session not found in Redis cache, trying PostgreSQL")
 
 	// 如果Redis中没有，从PostgreSQL获取
 	storageSession, err = m.metadataStore.GetSigningSession(ctx, sessionID)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get session")
+		log.Error().
+			Err(err).
+			Str("session_id", sessionID).
+			Msg("Failed to get session from both Redis and PostgreSQL - session does not exist or database error")
+		return nil, errors.Wrapf(err, "failed to get session %s from both Redis and PostgreSQL", sessionID)
 	}
+
+	log.Debug().
+		Str("session_id", sessionID).
+		Str("key_id", storageSession.KeyID).
+		Str("protocol", storageSession.Protocol).
+		Str("status", storageSession.Status).
+		Msg("Session retrieved from PostgreSQL")
 
 	// 转换并返回
 	return convertStorageSession(storageSession), nil
@@ -241,13 +315,26 @@ func (m *Manager) CompleteSession(ctx context.Context, sessionID string, signatu
 
 // CompleteKeygenSession 完成 DKG 会话并写入公钥，更新密钥为 Active
 func (m *Manager) CompleteKeygenSession(ctx context.Context, keyID string, publicKey string) error {
+	log.Info().
+		Str("key_id", keyID).
+		Str("public_key", publicKey).
+		Msg("Starting CompleteKeygenSession")
+
 	session, err := m.GetSession(ctx, keyID) // DKG 会话的 sessionID 等于 keyID
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Msg("Failed to get keygen session in CompleteKeygenSession")
 		return errors.Wrap(err, "failed to get keygen session")
 	}
 
 	// 仅允许在 Pending/Active 状态完成
 	if session.Status != string(SessionStatusPending) && session.Status != string(SessionStatusActive) {
+		log.Warn().
+			Str("key_id", keyID).
+			Str("session_status", session.Status).
+			Msg("Cannot complete session - session is not in Pending or Active status")
 		return errors.Errorf("cannot complete session in status %s", session.Status)
 	}
 
@@ -259,21 +346,47 @@ func (m *Manager) CompleteKeygenSession(ctx context.Context, keyID string, publi
 
 	// 更新会话
 	if err := m.UpdateSession(ctx, session); err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Msg("Failed to update keygen session in CompleteKeygenSession")
 		return errors.Wrap(err, "failed to update keygen session")
 	}
+	log.Info().
+		Str("key_id", keyID).
+		Msg("Keygen session updated successfully")
 
 	// 更新密钥元数据：公钥 + 状态 Active
 	keyMeta, err := m.metadataStore.GetKeyMetadata(ctx, keyID)
 	if err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Msg("Failed to get key metadata in CompleteKeygenSession")
 		return errors.Wrap(err, "failed to get key metadata")
 	}
+
+	oldStatus := keyMeta.Status
 	keyMeta.PublicKey = publicKey
 	keyMeta.Status = "Active"
 	keyMeta.UpdatedAt = now
 
 	if err := m.metadataStore.UpdateKeyMetadata(ctx, keyMeta); err != nil {
+		log.Error().
+			Err(err).
+			Str("key_id", keyID).
+			Str("old_status", oldStatus).
+			Str("new_status", "Active").
+			Msg("Failed to update key metadata in CompleteKeygenSession")
 		return errors.Wrap(err, "failed to update key metadata")
 	}
+
+	log.Info().
+		Str("key_id", keyID).
+		Str("old_status", oldStatus).
+		Str("new_status", "Active").
+		Str("public_key", publicKey).
+		Msg("Key metadata updated successfully - DKG completed")
 
 	return nil
 }

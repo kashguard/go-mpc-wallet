@@ -10,6 +10,7 @@ import (
 	pb "github.com/kashguard/go-mpc-wallet/internal/pb/mpc/v1"
 	"github.com/kashguard/tss-lib/tss"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,10 +39,12 @@ type ClientConfig struct {
 
 // NewGRPCClient 创建gRPC客户端
 func NewGRPCClient(cfg config.Server, nodeManager *node.Manager) (*GRPCClient, error) {
+	// DKG 协议可能需要较长时间（几分钟），设置更长的超时时间
+	// KeepAlive Timeout 设置为 10 分钟，确保长运行的 RPC 调用不会被中断
 	clientCfg := &ClientConfig{
 		TLSEnabled: cfg.MPC.TLSEnabled,
-		Timeout:    30 * time.Second,
-		KeepAlive:  30 * time.Second,
+		Timeout:    10 * time.Minute, // 增加到 10 分钟
+		KeepAlive:  10 * time.Minute, // 增加到 10 分钟
 	}
 
 	return &GRPCClient{
@@ -142,11 +145,13 @@ func (c *GRPCClient) getOrCreateConnection(ctx context.Context, nodeID string) (
 	}))
 
 	// 建立连接
-	// log.Debug().Str("node_id", nodeID).Str("endpoint", nodeInfo.Endpoint).Msg("Dialing gRPC node")
+	log.Debug().Str("node_id", nodeID).Str("endpoint", nodeInfo.Endpoint).Msg("Dialing gRPC node")
 	conn, err := grpc.NewClient(nodeInfo.Endpoint, opts...)
 	if err != nil {
+		log.Error().Err(err).Str("node_id", nodeID).Str("endpoint", nodeInfo.Endpoint).Msg("Failed to connect to gRPC node")
 		return nil, errors.Wrapf(err, "failed to connect to node %s at %s", nodeID, nodeInfo.Endpoint)
 	}
+	log.Debug().Str("node_id", nodeID).Str("endpoint", nodeInfo.Endpoint).Msg("Successfully connected to gRPC node")
 
 	// 创建客户端
 	client = pb.NewMPCNodeClient(conn)
@@ -160,11 +165,40 @@ func (c *GRPCClient) getOrCreateConnection(ctx context.Context, nodeID string) (
 
 // SendStartDKG 调用参与者的 StartDKG RPC
 func (c *GRPCClient) SendStartDKG(ctx context.Context, nodeID string, req *pb.StartDKGRequest) (*pb.StartDKGResponse, error) {
+	log.Debug().
+		Str("node_id", nodeID).
+		Str("key_id", req.KeyId).
+		Msg("Sending StartDKG RPC to participant")
+	
 	client, err := c.getOrCreateConnection(ctx, nodeID)
 	if err != nil {
+		log.Error().Err(err).Str("node_id", nodeID).Msg("Failed to get gRPC connection")
 		return nil, errors.Wrapf(err, "failed to get connection to node %s", nodeID)
 	}
-	return client.StartDKG(ctx, req)
+	
+	log.Debug().
+		Str("node_id", nodeID).
+		Str("key_id", req.KeyId).
+		Msg("Calling StartDKG RPC")
+	
+	resp, err := client.StartDKG(ctx, req)
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("node_id", nodeID).
+			Str("key_id", req.KeyId).
+			Msg("StartDKG RPC call failed")
+		return nil, err
+	}
+	
+	log.Debug().
+		Str("node_id", nodeID).
+		Str("key_id", req.KeyId).
+		Bool("started", resp.Started).
+		Str("message", resp.Message).
+		Msg("StartDKG RPC call succeeded")
+	
+	return resp, nil
 }
 
 // SendSigningMessage 发送签名协议消息到目标节点
@@ -203,7 +237,7 @@ func (c *GRPCClient) SendSigningMessage(ctx context.Context, nodeID string, msg 
 }
 
 // SendKeygenMessage 发送DKG协议消息到目标节点
-func (c *GRPCClient) SendKeygenMessage(ctx context.Context, nodeID string, msg tss.Message, sessionID string) error {
+func (c *GRPCClient) SendKeygenMessage(ctx context.Context, nodeID string, msg tss.Message, sessionID string, isBroadcast bool) error {
 	// 添加调试日志
 	// 注意：这里不能使用 log 包，因为 communication 包不应该依赖 log
 	// 但我们可以通过错误消息来调试
@@ -221,6 +255,18 @@ func (c *GRPCClient) SendKeygenMessage(ctx context.Context, nodeID string, msg t
 
 	// 确定轮次（tss-lib的MessageRouting可能不包含Round字段，使用0作为默认值）
 	round := int32(0)
+	// 如果 tss 消息没有目标（broadcast）或上层标记为广播，则使用 -1
+	if len(msg.GetTo()) == 0 || isBroadcast {
+		round = -1
+	}
+
+	log.Debug().
+		Str("session_id", sessionID).
+		Str("target_node_id", nodeID).
+		Int("to_count", len(msg.GetTo())).
+		Bool("is_broadcast_flag", isBroadcast).
+		Int32("round_set", round).
+		Msg("Sending DKG ShareRequest via gRPC")
 
 	// DKG消息也通过SubmitSignatureShare发送（使用相同的协议）
 	// 服务端会根据会话类型判断是DKG还是签名消息

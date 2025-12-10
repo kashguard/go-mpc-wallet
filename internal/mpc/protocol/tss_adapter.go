@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -37,7 +38,7 @@ type tssPartyManager struct {
 
 	// 消息路由：从 tss-lib 消息到节点通信
 	// 参数：sessionID（用于DKG或签名会话），nodeID（目标节点），msg（tss-lib消息）
-	messageRouter func(sessionID string, nodeID string, msg tss.Message) error
+	messageRouter func(sessionID string, nodeID string, msg tss.Message, isBroadcast bool) error
 
 	// 接收到的消息队列（用于处理来自其他节点的消息）
 	// 消息包含字节数据和发送方节点ID
@@ -50,11 +51,12 @@ type tssPartyManager struct {
 
 // incomingMessage 接收到的消息（包含消息字节和发送方信息）
 type incomingMessage struct {
-	msgBytes   []byte
-	fromNodeID string
+	msgBytes    []byte
+	fromNodeID  string
+	isBroadcast bool
 }
 
-func newTSSPartyManager(messageRouter func(sessionID string, nodeID string, msg tss.Message) error) *tssPartyManager {
+func newTSSPartyManager(messageRouter func(sessionID string, nodeID string, msg tss.Message, isBroadcast bool) error) *tssPartyManager {
 	return &tssPartyManager{
 		nodeIDToPartyID:         make(map[string]*tss.PartyID),
 		partyIDToNodeID:         make(map[string]string),
@@ -87,6 +89,11 @@ func (m *tssPartyManager) setupPartyIDs(nodeIDs []string) error {
 		m.nodeIDToPartyID[nodeID] = partyID
 		m.partyIDToNodeID[partyID.Id] = nodeID
 	}
+
+	log.Debug().
+		Strs("node_ids", nodeIDs).
+		Int("mapping_size", len(m.nodeIDToPartyID)).
+		Msg("PartyID mapping prepared")
 
 	return nil
 }
@@ -137,14 +144,26 @@ func (m *tssPartyManager) executeKeygen(
 	threshold int,
 	thisNodeID string,
 ) (*keygen.LocalPartySaveData, error) {
-	if err := m.setupPartyIDs(nodeIDs); err != nil {
+	// 确保节点列表有序，避免 PartyID 映射不一致
+	sortedNodeIDs := make([]string, len(nodeIDs))
+	copy(sortedNodeIDs, nodeIDs)
+	sort.Strings(sortedNodeIDs)
+
+	if err := m.setupPartyIDs(sortedNodeIDs); err != nil {
 		return nil, errors.Wrap(err, "setup party IDs")
 	}
 
-	parties, err := m.getPartyIDs(nodeIDs)
+	parties, err := m.getPartyIDs(sortedNodeIDs)
 	if err != nil {
 		return nil, errors.Wrap(err, "get party IDs")
 	}
+
+	log.Info().
+		Str("key_id", keyID).
+		Strs("node_ids_sorted", sortedNodeIDs).
+		Int("party_count", len(parties)).
+		Int("threshold", threshold).
+		Msg("Starting TSS keygen with sorted node list")
 
 	thisPartyID, ok := m.nodeIDToPartyID[thisNodeID]
 	if !ok {
@@ -224,11 +243,12 @@ func (m *tssPartyManager) executeKeygen(
 				// 使用UpdateFromBytes将消息注入到LocalParty
 				// isBroadcast参数：如果消息是广播消息则为true，否则为false
 				// 注意：tss-lib 的 UpdateFromBytes 方法必须被调用，否则 party 无法处理接收到的消息
-				ok, tssErr := localParty.UpdateFromBytes(incomingMsg.msgBytes, fromPartyID, false)
+				ok, tssErr := localParty.UpdateFromBytes(incomingMsg.msgBytes, fromPartyID, incomingMsg.isBroadcast)
 				if !ok || tssErr != nil {
 					log.Warn().
 						Err(tssErr).
 						Str("from_node_id", incomingMsg.fromNodeID).
+						Bool("is_broadcast", incomingMsg.isBroadcast).
 						Msg("Failed to update local party from bytes")
 					continue
 				}
@@ -237,7 +257,12 @@ func (m *tssPartyManager) executeKeygen(
 	}()
 
 	// 处理消息和结果
-	timeout := time.NewTimer(5 * time.Minute)
+	// 使用调用方上下文的截止时间作为超时，否则默认 10 分钟
+	timeoutDur := 10 * time.Minute
+	if deadline, ok := ctx.Deadline(); ok {
+		timeoutDur = time.Until(deadline)
+	}
+	timeout := time.NewTimer(timeoutDur)
 	defer timeout.Stop()
 
 	for {
@@ -268,11 +293,12 @@ func (m *tssPartyManager) executeKeygen(
 			// 路由到所有目标节点
 			targetNodes := msg.GetTo()
 			if len(targetNodes) == 0 {
-				// 如果没有目标节点，可能是广播消息，需要发送给所有其他节点
+				// 广播消息：发送给所有其他节点，并在接收端以 isBroadcast=true 注入
 				log.Error().
 					Str("keyID", keyID).
 					Str("thisNodeID", thisNodeID).
-					Msg("Message has no target nodes, broadcasting to all other nodes")
+					Int("party_count", len(m.nodeIDToPartyID)).
+					Msg("Message has no target nodes, broadcasting to all other nodes (tss outCh)")
 
 				// 获取所有其他节点的 PartyID
 				m.mu.RLock()
@@ -284,7 +310,7 @@ func (m *tssPartyManager) executeKeygen(
 				}
 				m.mu.RUnlock()
 
-				// 将消息发送给所有其他节点
+				// 将消息发送给所有其他节点（标记 isBroadcast）
 				for _, partyID := range allPartyIDs {
 					targetNodeID, ok := m.partyIDToNodeID[partyID.Id]
 					if !ok {
@@ -299,9 +325,10 @@ func (m *tssPartyManager) executeKeygen(
 						Str("keyID", keyID).
 						Str("targetNodeID", targetNodeID).
 						Str("partyID", partyID.Id).
-						Msg("Broadcasting message to node")
+						Msg("Broadcasting message to node (marked isBroadcast)")
 
-					if err := m.messageRouter(sessionID, targetNodeID, msg); err != nil {
+					// 通过 messageRouter 发送（tss.Message 将在对端被序列化处理；标记广播语义由 UpdateFromBytes 的 isBroadcast 参数控制）
+					if err := m.messageRouter(sessionID, targetNodeID, msg, true); err != nil {
 						log.Error().
 							Err(err).
 							Str("keyID", keyID).
@@ -326,7 +353,7 @@ func (m *tssPartyManager) executeKeygen(
 					return nil, errors.Errorf("party ID to node ID mapping not found: %s (keyID: %s, thisNodeID: %s, available mappings: %v)", to.Id, keyID, thisNodeID, availableMappings)
 				}
 				// 添加调试信息到错误消息
-				if err := m.messageRouter(sessionID, targetNodeID, msg); err != nil {
+				if err := m.messageRouter(sessionID, targetNodeID, msg, false); err != nil {
 					return nil, errors.Wrapf(err, "route message to node %s (keyID: %s, thisNodeID: %s, partyID: %s, sessionID: %s)", targetNodeID, keyID, thisNodeID, to.Id, sessionID)
 				}
 			}
@@ -522,7 +549,7 @@ func (m *tssPartyManager) executeSigning(
 					if !ok {
 						return nil, errors.Errorf("party ID to node ID mapping not found: %s", to.Id)
 					}
-					if err := m.messageRouter(currentSessionID, targetNodeID, msg); err != nil {
+					if err := m.messageRouter(currentSessionID, targetNodeID, msg, false); err != nil {
 						return nil, errors.Wrapf(err, "route message to node %s", targetNodeID)
 					}
 				}
@@ -565,6 +592,7 @@ func (m *tssPartyManager) ProcessIncomingKeygenMessage(
 	sessionID string,
 	fromNodeID string,
 	msgBytes []byte,
+	isBroadcast bool,
 ) error {
 	// 将消息放入队列，由executeKeygen中的消息处理循环读取
 	// 消息包含字节数据和发送方节点ID
@@ -578,8 +606,9 @@ func (m *tssPartyManager) ProcessIncomingKeygenMessage(
 
 	// 创建消息对象
 	incomingMsg := &incomingMessage{
-		msgBytes:   msgBytes,
-		fromNodeID: fromNodeID,
+		msgBytes:    msgBytes,
+		fromNodeID:  fromNodeID,
+		isBroadcast: isBroadcast,
 	}
 
 	// 非阻塞发送
@@ -819,7 +848,7 @@ func (m *tssPartyManager) executeEdDSAKeygen(
 					if !ok {
 						return nil, errors.Errorf("party ID to node ID mapping not found: %s", to.Id)
 					}
-					if err := m.messageRouter(sessionID, targetNodeID, msg); err != nil {
+					if err := m.messageRouter(sessionID, targetNodeID, msg, false); err != nil {
 						return nil, errors.Wrapf(err, "route message to node %s", targetNodeID)
 					}
 				}
@@ -923,7 +952,7 @@ func (m *tssPartyManager) executeEdDSASigning(
 					if !ok {
 						return nil, errors.Errorf("party ID to node ID mapping not found: %s", to.Id)
 					}
-					if err := m.messageRouter(currentSessionID, targetNodeID, msg); err != nil {
+					if err := m.messageRouter(currentSessionID, targetNodeID, msg, false); err != nil {
 						return nil, errors.Wrapf(err, "route message to node %s", targetNodeID)
 					}
 				}

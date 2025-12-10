@@ -835,33 +835,16 @@ sequenceDiagram
     participant Storage
 
     Client->>Coordinator: 创建密钥 (CreateKeyRequest)
-    Coordinator->>Coordinator: 初始化DKG会话
+    Coordinator->>Coordinator: 初始化DKG会话（创建会话元数据）
+    Coordinator->>P1: StartDKG RPC（通知启动DKG）
+    
+    Note over P1,P3: 第一个Participant启动DKG协议，其他Participant通过消息自动启动
 
-    Coordinator->>P1: 启动DKG参与
-    Coordinator->>P2: 启动DKG参与
-    Coordinator->>P3: 启动DKG参与
+    P1->>P1: 启动tss-lib keygen.LocalParty
+    P2->>P2: 自动启动（收到消息后）
+    P3->>P3: 自动启动（收到消息后）
 
-    P1->>P1: 生成多项式份额
-    P2->>P2: 生成多项式份额
-    P3->>P3: 生成多项式份额
-
-    P1->>Coordinator: 发送份额承诺
-    P2->>Coordinator: 发送份额承诺
-    P3->>Coordinator: 发送份额承诺
-
-    Coordinator->>P1: 广播所有承诺
-    Coordinator->>P2: 广播所有承诺
-    Coordinator->>P3: 广播所有承诺
-
-    P1->>P1: 验证承诺并计算份额
-    P2->>P2: 验证承诺并计算份额
-    P3->>P3: 验证承诺并计算份额
-
-    P1->>Coordinator: 发送份额验证
-    P2->>Coordinator: 发送份额验证
-    P3->>Coordinator: 发送份额验证
-
-    Note over P1,P3: Round 2: 节点间交换DKG消息（通过gRPC）
+    Note over P1,P3: tss-lib DKG协议：所有消息在节点间直接交换（不经过Coordinator）
 
     P1->>P2: gRPC: DKG消息 (tss.Message)
     P1->>P3: gRPC: DKG消息 (tss.Message)
@@ -880,18 +863,22 @@ sequenceDiagram
     P2->>Storage: 存储本地密钥分片（加密）
     P3->>Storage: 存储本地密钥分片（加密）
 
+    Note over P1,P3: 第一个完成DKG的节点更新会话和密钥元数据
+
+    P1->>Coordinator: CompleteKeygenSession（更新公钥和状态）
+    
     Note over Coordinator: Coordinator只保存公钥和元数据，不接触私钥分片
 
-    Coordinator->>Storage: 保存密钥元数据
+    Coordinator->>Storage: 保存密钥元数据（公钥、状态等）
     Coordinator-->>Client: 返回密钥信息
 ```
 
 **tss-lib分布式签名架构要点**（详见 [`internal/mpc/protocol/tss_adapter.go`](internal/mpc/protocol/tss_adapter.go)）：
-- **分布式密钥生成（DKG）**：使用tss-lib的`keygen.LocalParty`，每个节点独立参与DKG协议，生成自己的`LocalPartySaveData`（包含私钥分片`Xi`），密钥分片永不离开节点。
-- **消息路由**：通过gRPC实现节点间消息交换，`messageRouter`函数将tss-lib的`tss.Message`序列化后发送到目标节点。
-- **消息接收处理**：`ProcessIncomingKeygenMessage`和`ProcessIncomingSigningMessage`接收gRPC消息，解析后调用`party.UpdateFromBytes`更新Party状态。
+- **分布式密钥生成（DKG）**：使用tss-lib的`keygen.LocalParty`，每个Participant节点独立参与DKG协议，生成自己的`LocalPartySaveData`（包含私钥分片`Xi`），密钥分片永不离开节点。Coordinator只负责创建会话并通知第一个Participant启动，之后所有DKG协议消息在Participant节点间直接交换，不经过Coordinator。
+- **消息路由**：通过gRPC实现Participant节点间直接消息交换，`messageRouter`函数将tss-lib的`tss.Message`序列化后直接发送到目标Participant节点，Coordinator不参与消息路由。
+- **消息接收处理**：`ProcessIncomingKeygenMessage`和`ProcessIncomingSigningMessage`接收gRPC消息，解析后调用`party.UpdateFromBytes`更新Party状态。Participant节点在收到第一个DKG消息时自动启动DKG协议。
 - **签名聚合**：tss-lib自动完成签名聚合，每个参与节点都能得到完整签名，无需Coordinator收集分片。
-- **Coordinator角色**：简化为轻量级协调者，负责会话管理、节点发现和审计，不接触私钥分片。
+- **Coordinator角色**：简化为轻量级协调者，负责会话管理、节点发现和审计，不参与DKG协议消息交换，不接触私钥分片。
 - **密钥分片存储**：每个Participant节点独立存储自己的`LocalPartySaveData`（加密存储），Coordinator只保存公钥和元数据。
 
 ---
