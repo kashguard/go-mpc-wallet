@@ -1,10 +1,11 @@
 # MPC 基础设施系统详细设计文档
 
-**版本**: v2.2
+**版本**: v2.4
 **文档类型**: 详细设计文档
 **创建日期**: 2024-11-28
 **基于**: MPC产品文档 + go-mpc-wallet项目代码 + MPCVault技术分析
 **更新日期**: 2025-01-02
+**状态**: 已根据实际代码实现全面更新
 
 ---
 
@@ -263,11 +264,21 @@ graph TB
 ```
 
 #### 1.4.6 基础设施层 (Infrastructure Layer)
-**基础设施组件**：
-- **gRPC Communication**: 高效的节点间通信
-- **Service Discovery**: 自动服务发现和注册
-- **Health Monitoring**: 健康检查和状态监控
-- **Metrics Collection**: 性能指标收集和告警
+**基础设施组件**（实际实现）：
+- **gRPC Communication**（[`internal/mpc/grpc/`](internal/mpc/grpc/)）：
+  - 客户端：连接池管理，KeepAlive 10分钟，Timeout 10分钟
+  - 服务端：MaxConnAge 2小时，KeepAlive 10分钟，支持TLS
+  - 消息路由：支持广播消息（round=-1标记）
+- **Service Discovery**（[`internal/mpc/discovery/consul.go`](internal/mpc/discovery/consul.go)）：
+  - Consul集成：服务注册和发现
+  - 节点发现：优先从数据库查询，不足时从Consul发现Participant节点
+  - 优雅注销：忽略404错误，防止服务未注册时的注销失败
+- **Node Management**（[`internal/mpc/node/`](internal/mpc/node/)）：
+  - 节点注册：支持Coordinator和Participant节点注册
+  - 节点发现：通过NodeDiscovery统一接口（数据库+Consul）
+  - 健康检查：节点状态管理（active, inactive, offline）
+- **Health Monitoring**: 健康检查和状态监控（通过Consul健康检查）
+- **Metrics Collection**: 性能指标收集和告警（待实现）
 
 ### 1.5 部署架构模式
 
@@ -453,35 +464,33 @@ graph TD
 #### 2.1.1 模块职责
 
 **核心功能**：
+- **DKG会话管理**：创建DKG会话，通知第一个Participant启动DKG协议
 - **签名会话管理**：创建、监控、销毁签名会话
-- **节点调度**：选择合适的Participant节点参与签名
-- **协议协调**：轻量级协调，不接触私钥分片
-- **消息路由**：通过gRPC转发协议消息（tss-lib自动聚合签名）
+- **节点发现**：通过Consul和数据库发现可用Participant节点
+- **协议协调**：轻量级协调，不接触私钥分片，不参与协议消息交换
+- **会话完成**：接收Participant的CompleteKeygenSession调用，更新密钥元数据
 
 #### 2.1.2 内部组件设计
 
 ```
-Coordinator Service 内部架构
-├── Session Manager (会话管理器)
-│   ├── 会话创建和初始化
-│   ├── 会话状态跟踪
-│   ├── 会话超时处理
-│   └── 会话清理回收
-├── Node Selector (节点选择器)
-│   ├── 可用节点发现
-│   ├── 负载均衡算法
-│   ├── 节点健康检查
-│   └── 故障节点排除
-├── Protocol Coordinator (协议协调器)
-│   ├── 协议引擎调用
-│   ├── 消息路由转发
-│   ├── 进度状态同步
-│   └── 错误处理重试
-└── Message Router (消息路由器)
-    ├── gRPC消息转发
-    ├── 节点间通信协调
-    ├── 会话状态同步
-    └── 错误处理和重试
+Coordinator Service 内部架构（实际实现）
+├── KeyService (密钥服务)
+│   ├── CreatePlaceholderKey: 创建占位符密钥（满足外键约束）
+│   └── CreateKeyWithExistingMetadata: 在占位符基础上执行DKG
+├── SessionManager (会话管理器)
+│   ├── CreateKeyGenSession: 创建DKG会话（使用keyID作为sessionID）
+│   ├── CreateSession: 创建签名会话
+│   ├── GetSession: 从Redis或PostgreSQL获取会话
+│   ├── CompleteKeygenSession: 完成DKG会话，更新密钥状态为Active
+│   └── StateStore: 会话状态持久化（PostgreSQL + Redis）
+├── NodeDiscovery (节点发现)
+│   ├── 优先从数据库查询节点
+│   ├── 不足时从Consul发现Participant节点
+│   └── 合并去重返回节点列表
+├── ProtocolEngine (协议引擎接口)
+│   └── 通过依赖注入获取，Coordinator不直接调用协议方法
+└── GRPCClient (gRPC客户端)
+    └── SendStartDKG: 异步通知第一个Participant启动DKG（5分钟超时）
 ```
 
 #### 2.1.3 关键接口设计
@@ -622,6 +631,7 @@ graph TD
 
 ```mermaid
 sequenceDiagram
+    participant Client
     participant Coordinator
     participant P1 as Participant 1
     participant P2 as Participant 2
@@ -629,33 +639,26 @@ sequenceDiagram
     participant Storage as KeyShareStorage
     participant Protocol as ProtocolEngine
 
-    Coordinator->>P1: 签名会话加入 (sessionID)
-    Coordinator->>P2: 签名会话加入 (sessionID)
-    Coordinator->>P3: 签名会话加入 (sessionID)
+    Client->>Coordinator: 创建签名会话 (SignRequest)
+    Coordinator->>Coordinator: 创建会话元数据 (session-{uuid})
+    Coordinator->>Coordinator: 选择参与节点 (达到阈值即可)
+    Coordinator-->>Client: 返回会话ID
+
+    Note over P1,P3: Coordinator创建会话后，节点通过gRPC自动参与
 
     P1->>Storage: 获取密钥分片 (keyID)
-    Storage-->>P1: 返回加密分片
-    P1->>P1: 解密分片
+    Storage-->>P1: 返回LocalPartySaveData
+    P1->>P1: 加载tss-lib Party状态
 
     P2->>Storage: 获取密钥分片 (keyID)
-    Storage-->>P2: 返回加密分片
-    P2->>P2: 解密分片
+    Storage-->>P2: 返回LocalPartySaveData
+    P2->>P2: 加载tss-lib Party状态
 
     P3->>Storage: 获取密钥分片 (keyID)
-    Storage-->>P3: 返回加密分片
-    P3->>P3: 解密分片
+    Storage-->>P3: 返回LocalPartySaveData
+    P3->>P3: 加载tss-lib Party状态
 
-    Note over P1,P3: Round 1: 生成承诺和随机数
-
-    P1->>Coordinator: 发送承诺 (commitment_1)
-    P2->>Coordinator: 发送承诺 (commitment_2)
-    P3->>Coordinator: 发送承诺 (commitment_3)
-
-    Coordinator->>P1: 广播所有承诺
-    Coordinator->>P2: 广播所有承诺
-    Coordinator->>P3: 广播所有承诺
-
-    Note over P1,P3: Round 2: 节点间交换签名消息（通过gRPC）
+    Note over P1,P3: tss-lib签名协议：所有消息在节点间直接交换（不经过Coordinator）
 
     P1->>P2: gRPC: 签名消息 (tss.Message)
     P1->>P3: gRPC: 签名消息 (tss.Message)
@@ -666,58 +669,66 @@ sequenceDiagram
 
     Note over P1,P3: tss-lib自动聚合签名，每个节点得到完整签名
 
-    P1->>P1: tss-lib聚合签名
-    P2->>P2: tss-lib聚合签名
-    P3->>P3: tss-lib聚合签名
+    P1->>P1: tss-lib聚合签名（signing.LocalParty）
+    P2->>P2: tss-lib聚合签名（signing.LocalParty）
+    P3->>P3: tss-lib聚合签名（signing.LocalParty）
 
-    P1->>Coordinator: 返回最终签名
-    P2->>Coordinator: 返回最终签名
-    P3->>Coordinator: 返回最终签名
+    Note over Coordinator: Coordinator只保存会话状态，不接触签名过程
+
+    P1->>Coordinator: CompleteSession (更新会话状态)
+    Coordinator->>Coordinator: 更新会话为completed
+    Coordinator-->>Client: 返回签名结果
 ```
 
 ### 2.3 Protocol Engine (协议引擎)
 
 #### 2.3.1 支持的协议
 
-**GG18/GG20 协议**：
-- **GG18**: 4轮通信的ECDSA阈值签名
-- **GG20**: 改进版，1轮通信，更高效
-- **特点**: 成熟稳定，经过生产验证
+**GG18/GG20 协议**（实际实现）：
+- **GG18**: 基于`tss-lib/ecdsa/keygen`和`tss-lib/ecdsa/signing`，4轮通信的ECDSA阈值签名
+- **GG20**: 继承GG18，单轮签名优化，支持可识别的中止（Identifiable Abort）
+- **特点**: 使用生产级tss-lib库，经过生产验证
+- **实现位置**: [`internal/mpc/protocol/gg18.go`](internal/mpc/protocol/gg18.go), [`internal/mpc/protocol/gg20.go`](internal/mpc/protocol/gg20.go)
 
-**FROST 协议**：
+**FROST 协议**（部分实现）：
 - **IETF标准**: 两轮通信的Schnorr签名
-- **优势**: 更灵活的阈值配置，性能更好
-- **适用**: 未来扩展
+- **实现**: 基于`tss-lib/eddsa/keygen`和`tss-lib/eddsa/signing`
+- **状态**: 基础框架已实现，待完善
+- **实现位置**: [`internal/mpc/protocol/frost.go`](internal/mpc/protocol/frost.go)
 
 #### 2.3.2 协议引擎架构
 
 ```
-Protocol Engine 架构
-├── Protocol Registry (协议注册器)
-│   ├── 协议注册管理
-│   ├── 协议版本控制
-│   ├── 协议配置管理
-│   └── 协议切换逻辑
+Protocol Engine 架构（实际实现）
+├── Engine Interface (协议引擎接口)
+│   ├── GenerateKeyShare: 分布式密钥生成
+│   ├── ThresholdSign: 阈值签名
+│   ├── VerifySignature: 签名验证
+│   ├── ProcessIncomingKeygenMessage: 处理DKG消息
+│   └── ProcessIncomingSigningMessage: 处理签名消息
+├── tssPartyManager (tss-lib适配层)
+│   ├── activeKeygen: 活跃的DKG协议实例
+│   ├── activeSigning: 活跃的签名协议实例
+│   ├── nodeIDToPartyID: 节点ID到PartyID映射
+│   ├── incomingKeygenMessages: DKG消息队列
+│   └── incomingSigningMessages: 签名消息队列
 ├── GG18 Protocol (GG18协议实现)
-│   ├── Round 1: 承诺生成
-│   ├── Round 2: 承诺交换验证
-│   ├── Round 3: 签名分片计算
-│   └── Round 4: 签名聚合
+│   ├── 基于tss-lib/ecdsa/keygen: DKG协议
+│   ├── 基于tss-lib/ecdsa/signing: 签名协议
+│   ├── 消息路由: 通过messageRouter发送到其他节点
+│   └── 广播消息: 支持targetCount=0的广播消息
 ├── GG20 Protocol (GG20协议实现)
-│   ├── Round 1: 统一承诺和签名
-│   ├── 签名分片生成
-│   ├── 分片聚合验证
-│   └── 最终签名构造
+│   ├── 继承GG18Protocol: 复用DKG逻辑
+│   ├── 单轮签名优化: 减少网络往返
+│   └── 可识别中止: Identifiable Abort支持
 ├── FROST Protocol (FROST协议实现)
-│   ├── Round 1: 承诺生成
-│   ├── Round 2: 签名聚合
-│   ├── 挑战响应机制
-│   └── Schnorr签名构造
-└── Protocol State Manager (协议状态管理)
-    ├── 状态机管理
-    ├── 进度跟踪
-    ├── 错误处理
-    └── 状态持久化
+│   ├── 基于tss-lib/eddsa/keygen: EdDSA DKG
+│   ├── 基于tss-lib/eddsa/signing: EdDSA签名
+│   └── Schnorr签名: 两轮通信
+└── Protocol Registry (协议注册表)
+    ├── 协议注册: 支持多协议注册
+    ├── 默认协议: GG20
+    └── 协议切换: 通过协议名称选择
 ```
 
 #### 2.3.3 GG20签名协议详细流程
@@ -889,11 +900,23 @@ sequenceDiagram
 
 #### 3.0.1 gRPC通信层
 
-**架构说明**：
-- **gRPC客户端**（`internal/mpc/communication/grpc_client.go`）：负责向其他节点发送tss-lib协议消息
-- **gRPC服务端**（`internal/mpc/communication/grpc_server.go`）：接收来自其他节点的消息，并转发给协议引擎
-- **消息路由**：`messageRouter`函数将`tss.Message`序列化后通过gRPC发送到目标节点
+**架构说明**（实际实现）：
+- **gRPC客户端**（`internal/mpc/grpc/client.go`）：负责向其他节点发送tss-lib协议消息
+  - `SendKeygenMessage`: 发送DKG消息，支持广播消息（round=-1标记）
+  - `SendSigningMessage`: 发送签名消息
+  - `SendStartDKG`: Coordinator通知Participant启动DKG
+  - 连接池管理：KeepAlive 10分钟，Timeout 10分钟
+- **gRPC服务端**（`internal/mpc/grpc/server.go`）：接收来自其他节点的消息
+  - `SubmitSignatureShare`: 接收协议消息（DKG或签名）
+  - `StartDKG`: Participant接收DKG启动请求
+  - `handleProtocolMessage`: 处理协议消息，自动启动DKG（如果收到第一个消息）
+  - 服务器配置：MaxConnAge 2小时，KeepAlive 10分钟
+- **消息路由**：`messageRouter`函数（在`internal/api/providers.go`中定义）将`tss.Message`序列化后通过gRPC发送
+  - 支持广播消息：`isBroadcast`参数，`round=-1`标记
+  - 消息序列化：使用`msg.WireBytes()`
 - **消息处理**：`ProcessIncomingKeygenMessage`和`ProcessIncomingSigningMessage`接收消息并更新Party状态
+  - 自动启动DKG：Participant收到第一个DKG消息时自动启动协议
+  - 广播消息处理：通过`round=-1`识别，调用`UpdateFromBytes`时传递`isBroadcast=true`
 
 **通信流程**：
 ```mermaid
@@ -913,11 +936,24 @@ sequenceDiagram
     TSS-->>P2: 更新Party状态
 ```
 
-**关键实现**：
+**关键实现**（实际代码）：
 - **消息序列化**：使用`msg.WireBytes()`将`tss.Message`序列化为字节数组
-- **消息反序列化**：使用`tss.ParseWireMessage`解析接收到的字节数组
-- **会话管理**：通过`sessionID`关联消息和签名会话
-- **错误处理**：实现重试机制和超时控制
+- **消息反序列化**：在`tss_adapter.go`中通过`party.UpdateFromBytes(msgBytes, isBroadcast)`更新Party状态
+- **广播消息处理**：
+  - 发送端：`targetCount=0`的消息标记为广播，设置`round=-1`
+  - 接收端：通过`shareMsg.Round == -1`识别广播消息，传递给`UpdateFromBytes`时设置`isBroadcast=true`
+- **会话管理**：
+  - DKG会话：使用`keyID`作为`sessionID`
+  - 签名会话：使用`session-{uuid}`格式
+  - 会话存储：PostgreSQL（持久化）+ Redis（缓存，TTL=会话超时）
+- **自动启动DKG**：
+  - Participant收到第一个DKG消息时，检查会话是否存在
+  - 如果会话存在但DKG未启动，自动调用`GenerateKeyShare`启动协议
+  - 使用`sync.Once`确保每个会话只启动一次
+- **错误处理**：
+  - gRPC连接重试：指数退避
+  - 会话保存重试：3次重试，指数退避
+  - 超时控制：DKG 10分钟，签名5分钟
 
 ### 3.1 gRPC 接口设计
 
@@ -995,29 +1031,43 @@ message SignResponse {
 #### 3.2.1 API 路径设计
 
 ```
-/api/v1
-├── /keys                          # 密钥管理
-│   ├── POST   /keys               # 创建密钥
+/api/v1/mpc
+├── /keys                          # 密钥管理（实际实现）
+│   ├── POST   /keys               # 创建密钥（触发DKG）
+│   │   └── Handler: post_create_key.go
 │   ├── GET    /keys               # 列出密钥
+│   │   └── Handler: get_list_keys.go
 │   ├── GET    /keys/{key_id}      # 获取密钥
-│   ├── PUT    /keys/{key_id}      # 更新密钥
+│   │   └── Handler: get_key.go
 │   ├── DELETE /keys/{key_id}      # 删除密钥
-│   └── POST   /keys/{key_id}/rotate # 轮换密钥
-├── /sign                          # 签名服务
+│   │   └── Handler: delete_key.go
+│   └── POST   /keys/{key_id}/address # 生成地址
+│       └── Handler: post_generate_address.go
+├── /sign                          # 签名服务（实际实现）
 │   ├── POST   /sign               # 单次签名
+│   │   └── Handler: post_sign.go
 │   ├── POST   /sign/batch         # 批量签名
+│   │   └── Handler: post_batch_sign.go
 │   └── POST   /verify             # 签名验证
-├── /sessions                      # 会话管理
-│   ├── POST   /sessions           # 创建会话
+│       └── Handler: post_verify.go
+├── /sessions                      # 会话管理（实际实现）
+│   ├── POST   /sessions           # 创建签名会话
+│   │   └── Handler: post_create_session.go
 │   ├── GET    /sessions/{session_id} # 获取会话
+│   │   └── Handler: get_session.go
 │   ├── POST   /sessions/{session_id}/join # 加入会话
+│   │   └── Handler: post_join_session.go
 │   └── POST   /sessions/{session_id}/cancel # 取消会话
-└── /nodes                         # 节点管理
+│       └── Handler: post_cancel_session.go
+└── /nodes                         # 节点管理（实际实现）
     ├── POST   /nodes              # 注册节点
+    │   └── Handler: post_register_node.go
     ├── GET    /nodes              # 列出节点
+    │   └── Handler: get_list_nodes.go
     ├── GET    /nodes/{node_id}    # 获取节点
-    ├── GET    /nodes/{node_id}/health # 节点健康
-    └── DELETE /nodes/{node_id}    # 注销节点
+    │   └── Handler: get_node.go
+    └── GET    /nodes/{node_id}/health # 节点健康
+        └── Handler: get_node_health.go
 ```
 
 #### 3.2.2 API 响应格式
@@ -1067,25 +1117,47 @@ tls:
 └── API密钥：应用级认证
 ```
 
-#### 2.4.4 GG18 阈值签名实现（四轮模拟）
+#### 2.4.4 协议引擎实现（基于 tss-lib）
 
-- 代码入口：[`internal/mpc/protocol/gg18_sign.go`](internal/mpc/protocol/gg18_sign.go)，以 4 个逻辑轮次模拟 GG18 的承诺、随机数交换、分片计算与聚合，内部 `signingRoundState` 会记录 session 轮次、参与节点、耗时，便于集成到 `session.Manager`。
-- `ThresholdSign` 会从缓存的分片（或自动生成的节点 ID）中挑选满足阈值的 shares，调用 `reconstructSecret` 还原私钥，再通过 `secp256k1/v4/ecdsa` 进行 ECDSA 签名，输出 DER 编码 + R/S。
-- 测试覆盖：[`gg18_sign_test.go`](internal/mpc/protocol/gg18_sign_test.go) 验证成功签名、节点不足时的错误分支以及基准测试。
-- 基准结果（MacBook Air M1, Go `go1.24.6`, `go test -bench=BenchmarkGG18ThresholdSign -benchmem -run='^$' ./internal/mpc/protocol`）：
+**实际实现架构**（详见 [`internal/mpc/protocol/tss_adapter.go`](internal/mpc/protocol/tss_adapter.go)）：
 
-| Benchmark | ns/op | B/op | allocs/op |
-|-----------|-------|------|-----------|
-| `BenchmarkGG18ThresholdSign-8` | **43,353 ns** | **4,644 B** | **93** |
-| `BenchmarkGG20ThresholdSign-8` | **42,665 ns** | **4,444 B** | **91** |
+- **tssPartyManager**：管理tss-lib的Party实例和消息路由
+  - `activeKeygen`: 当前活跃的DKG协议实例（`keygen.LocalParty`）
+  - `activeSigning`: 当前活跃的签名协议实例（`signing.LocalParty`）
+  - `nodeIDToPartyID`: 节点ID到PartyID的映射（使用节点ID的SHA-256哈希作为唯一密钥）
+  - `incomingKeygenMessages`: 接收到的DKG消息队列（按sessionID组织）
+  - `incomingSigningMessages`: 接收到的签名消息队列
 
-这些数据（约 0.043ms/签名）作为开发期的基准，用于对比后续 GG20 优化与真实 tss-lib 集成。进度信息可通过 session state 或 round tracker 暴露给监控系统，后续 Phase 1C 将把这些指标汇总进 Prometheus。
+- **GG18协议实现**（[`internal/mpc/protocol/gg18.go`](internal/mpc/protocol/gg18.go)）：
+  - 基于`tss-lib/ecdsa/keygen`和`tss-lib/ecdsa/signing`
+  - `GenerateKeyShare`: 执行DKG协议，生成`LocalPartySaveData`（包含私钥分片`Xi`）
+  - `ThresholdSign`: 执行阈值签名，使用`signing.LocalParty`
+  - 消息路由：通过`messageRouter`函数发送到其他Participant节点
+  - 广播消息：`targetCount=0`的消息自动广播到所有其他节点
 
-#### 2.4.5 GG20 单轮聚合（对比 GG18）
+- **GG20协议实现**（[`internal/mpc/protocol/gg20.go`](internal/mpc/protocol/gg20.go)）：
+  - 继承`GG18Protocol`，复用DKG逻辑
+  - `ThresholdSign`: 使用GG20的单轮签名优化
+  - 支持可识别的中止（Identifiable Abort）
 
-- GG20 在实现上复用 `GG18Protocol` 的 DKG / share 逻辑，`GenerateKeyShare` 直接委托 [`internal/mpc/protocol/gg20.go`](internal/mpc/protocol/gg20.go) 中的包装器，以确保数据格式一致。
-- `ThresholdSign` 通过调用 `thresholdSignInternal` 并传入两轮描述（commit+aggregate、partial+final），从而把状态跟踪浓缩为 2 个阶段，也为后续引入 Identifiable Abort 留好挂点。
-- 基准数据显示，GG20 stub 相比 GG18 在相同输入下略有更低的内存/分配，并可通过减少轮次在真实场景获得更少的网络往返。
+- **消息处理流程**：
+  1. 接收gRPC消息：`SubmitSignatureShare` → `handleProtocolMessage`
+  2. 识别协议类型：通过`session.Protocol`判断是DKG还是签名
+  3. 自动启动DKG：如果收到第一个DKG消息且协议未启动，自动启动
+  4. 更新Party状态：调用`party.UpdateFromBytes(msgBytes, isBroadcast)`
+  5. 处理Party输出：从`outCh`接收消息，路由到其他节点
+
+- **密钥分片存储**：
+  - 每个Participant节点只存储自己的`LocalPartySaveData`
+  - 加密存储：使用AES-256-GCM加密
+  - 存储位置：`/var/lib/mpc/key-shares/{key_id}/{node_id}.enc`
+  - Coordinator不存储密钥分片，只保存公钥和元数据
+
+- **性能特性**：
+  - DKG超时：10分钟（可配置）
+  - 签名超时：5分钟（可配置）
+  - 消息大小限制：10MB（gRPC配置）
+  - 连接保持：KeepAlive 10分钟，MaxConnAge 2小时
 
 ---
 
@@ -1093,32 +1165,44 @@ tls:
 
 ### 4.1 数据库表结构
 
-#### 4.1.1 Keys 表 (密钥元数据)
+#### 4.1.1 Keys 表 (密钥元数据) - 实际实现
 
+**表结构**（详见 [`migrations/`](migrations/) 和 [`internal/models/keys.go`](internal/models/keys.go)）：
 ```sql
 CREATE TABLE keys (
     key_id VARCHAR(255) PRIMARY KEY,
-    public_key TEXT NOT NULL,
-    algorithm VARCHAR(50) NOT NULL,
-    curve VARCHAR(50) NOT NULL,
-    threshold INTEGER NOT NULL,
-    total_nodes INTEGER NOT NULL,
-    chain_type VARCHAR(50) NOT NULL,
-    address TEXT,
-    status VARCHAR(50) NOT NULL DEFAULT 'Active',
+    public_key TEXT NOT NULL,              -- DKG完成后更新为真实公钥，初始为"pending"
+    algorithm VARCHAR(50) NOT NULL,       -- ECDSA, EdDSA
+    curve VARCHAR(50) NOT NULL,           -- secp256k1, ed25519
+    threshold INTEGER NOT NULL,           -- 阈值（如2-of-3）
+    total_nodes INTEGER NOT NULL,         -- 总节点数
+    chain_type VARCHAR(50) NOT NULL,       -- bitcoin, ethereum, evm
+    address TEXT,                         -- 区块链地址（可选，可通过API生成）
+    status VARCHAR(50) NOT NULL DEFAULT 'Pending', -- Pending, Active, Deleted
     description TEXT,
     tags JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deletion_date TIMESTAMPTZ
+    deletion_date TIMESTAMPTZ             -- 软删除标记
 );
 
--- 索引
+-- 索引（实际创建）
 CREATE INDEX idx_keys_chain_type ON keys(chain_type);
 CREATE INDEX idx_keys_status ON keys(status);
 CREATE INDEX idx_keys_created_at ON keys(created_at);
 CREATE INDEX idx_keys_algorithm ON keys(algorithm);
 ```
+
+**状态流转**（实际实现）：
+- `Pending`: 创建占位符密钥时（DKG开始前）
+- `Active`: DKG完成后，通过`CompleteKeygenSession`更新
+- `Deleted`: 删除密钥时，设置`deletion_date`
+
+**存储实现**（详见 [`internal/mpc/storage/postgresql.go`](internal/mpc/storage/postgresql.go)）：
+- `SaveKeyMetadata`: 使用`INSERT ... ON CONFLICT DO UPDATE`实现upsert
+- `GetKeyMetadata`: 查询密钥元数据，支持软删除检查
+- `UpdateKeyMetadata`: 更新密钥元数据（包括状态、公钥等）
+- `ListKeys`: 支持按`chain_type`、`status`、`tags`过滤
 
 #### 4.1.2 Nodes 表 (节点信息)
 
@@ -1143,34 +1227,53 @@ CREATE INDEX idx_nodes_endpoint ON nodes(endpoint);
 CREATE INDEX idx_nodes_load ON nodes(load_factor);
 ```
 
-#### 4.1.3 Signing Sessions 表 (签名会话)
+#### 4.1.3 Signing Sessions 表 (签名会话) - 实际实现
 
+**表结构**（详见 [`migrations/`](migrations/) 和 [`internal/models/signing_sessions.go`](internal/models/signing_sessions.go)）：
 ```sql
 CREATE TABLE signing_sessions (
     session_id VARCHAR(255) PRIMARY KEY,
     key_id VARCHAR(255) NOT NULL,
-    protocol VARCHAR(50) NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    protocol VARCHAR(50) NOT NULL,         -- "keygen", "dkg", "gg18", "gg20", "frost"
+    status VARCHAR(50) NOT NULL DEFAULT 'pending', -- pending, active, completed, cancelled, timeout
     threshold INTEGER NOT NULL,
     total_nodes INTEGER NOT NULL,
-    participating_nodes JSONB,
-    current_round INTEGER DEFAULT 0,
-    total_rounds INTEGER NOT NULL,
-    signature TEXT,
-    message_hash VARCHAR(128),
+    participating_nodes JSONB,            -- 参与节点列表（数组）
+    current_round INTEGER DEFAULT 0,     -- 当前协议轮次
+    total_rounds INTEGER NOT NULL,        -- 总轮次数（GG18/GG20为4）
+    signature TEXT,                       -- 签名结果（对于DKG，存储公钥）
+    message_hash VARCHAR(128),            -- 待签名消息哈希（可选）
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    duration_ms INTEGER,
-    error_message TEXT,
+    completed_at TIMESTAMPTZ,             -- 完成时间
+    duration_ms INTEGER,                  -- 耗时（毫秒）
+    error_message TEXT,                   -- 错误信息（可选）
     FOREIGN KEY (key_id) REFERENCES keys(key_id) ON DELETE CASCADE
 );
 
--- 索引
-CREATE INDEX idx_sessions_key_id ON sessions(key_id);
-CREATE INDEX idx_sessions_status ON sessions(status);
-CREATE INDEX idx_sessions_created_at ON sessions(created_at);
-CREATE INDEX idx_sessions_protocol ON sessions(protocol);
+-- 索引（实际创建）
+CREATE INDEX idx_sessions_key_id ON signing_sessions(key_id);
+CREATE INDEX idx_sessions_status ON signing_sessions(status);
+CREATE INDEX idx_sessions_created_at ON signing_sessions(created_at);
+CREATE INDEX idx_sessions_protocol ON signing_sessions(protocol);
 ```
+
+**特殊用途**（实际实现）：
+- **DKG会话**：使用`keyID`作为`sessionID`，`protocol`为"keygen"或"dkg"
+- **签名会话**：使用`session-{uuid}`格式，`protocol`为"gg18"或"gg20"
+- **状态管理**：
+  - `pending`: 会话创建，等待节点加入
+  - `active`: 协议执行中
+  - `completed`: 协议完成（DKG生成公钥，签名生成签名）
+  - `cancelled`: 会话取消
+  - `timeout`: 会话超时
+
+**存储实现**（详见 [`internal/mpc/session/manager.go`](internal/mpc/session/manager.go)）：
+- `CreateKeyGenSession`: 创建DKG会话，使用`keyID`作为`sessionID`
+- `CreateSession`: 创建签名会话，生成`session-{uuid}`
+- `GetSession`: 先查Redis缓存，未命中再查PostgreSQL
+- `UpdateSession`: 同时更新PostgreSQL和Redis
+- `CompleteKeygenSession`: 完成DKG会话，更新密钥状态为`Active`
+- 重试机制：会话保存失败时，最多重试3次（指数退避）
 
 #### 4.1.4 Audit Logs 表 (审计日志)
 
@@ -1203,16 +1306,21 @@ CREATE INDEX idx_audit_request_id ON audit_logs(request_id);
 
 ### 4.2 Redis 数据结构
 
-#### 4.2.1 会话缓存
+#### 4.2.1 会话缓存（实际实现）
 
+**Redis Key 设计**（详见 [`internal/mpc/storage/redis.go`](internal/mpc/storage/redis.go)）：
 ```
 Redis Key 设计
-├── session:{session_id}          # 会话完整信息 (JSON)
-├── session:progress:{session_id} # 会话进度 (HASH)
-├── session:shares:{session_id}   # 签名分片收集 (SET)
-├── session:timeout:{session_id}  # 会话超时 (TTL)
-└── session:lock:{session_id}     # 会话分布式锁
+├── session:{session_id}          # 会话完整信息 (JSON, TTL=会话超时)
+└── session:lock:{session_id}    # 会话分布式锁（可选）
 ```
+
+**实际使用**：
+- **会话缓存**：`SaveSession`和`GetSession`使用Redis缓存会话信息
+- **TTL管理**：会话TTL = 会话超时时间（默认5分钟）
+- **缓存策略**：先查Redis，未命中再查PostgreSQL
+- **更新策略**：同时更新PostgreSQL和Redis（双写）
+- **会话状态**：包含`SessionID`, `KeyID`, `Protocol`, `Status`, `Threshold`, `TotalNodes`, `ParticipatingNodes`, `CurrentRound`, `TotalRounds`, `Signature`, `CreatedAt`, `CompletedAt`, `DurationMs`
 
 #### 4.2.2 节点状态
 
@@ -1226,18 +1334,22 @@ Redis Key 设计
 
 ### 4.3 密钥分片存储
 
-#### 4.3.1 文件系统存储结构
+#### 4.3.1 文件系统存储结构（实际实现）
 
+**存储路径**（详见 [`internal/mpc/storage/key_share_storage.go`](internal/mpc/storage/key_share_storage.go)）：
 ```
 /var/lib/mpc/key-shares/
 ├── {key_id}/
-│   ├── metadata.json          # 分片元数据
-│   ├── share.enc              # 加密分片数据
-│   ├── share.sig              # 分片签名验证
-│   ├── backup/                # 备份目录
-│   └── temp/                  # 临时文件
-└── archive/                   # 已删除分片归档
+│   └── {node_id}.enc          # 加密的LocalPartySaveData（AES-256-GCM）
+└── archive/                   # 已删除分片归档（可选）
 ```
+
+**实际实现**：
+- **存储格式**：每个节点的密钥分片单独存储为`{node_id}.enc`文件
+- **加密方式**：AES-256-GCM加密（使用配置的`MPC_KEY_SHARE_ENCRYPTION_KEY`）
+- **数据结构**：存储`tss-lib`的`LocalPartySaveData`（包含私钥分片`Xi`、公钥参数等）
+- **访问控制**：只有对应节点可以访问自己的分片文件
+- **备份策略**：可选的备份目录，支持定期备份
 
 #### 4.3.2 分片文件格式
 
@@ -3194,14 +3306,36 @@ data:
 
 ---
 
-**文档版本**: v2.3
+**文档版本**: v2.4
 **最后更新**: 2025-01-02
 **维护团队**: MPC 开发团队
-**文档状态**: 详细设计完成，已添加客户端集成和使用场景详解
+**文档状态**: 详细设计完成，已根据实际代码实现更新
 
 ---
 
 ## 更新日志
+
+### 2025-01-02 - 根据实际代码实现更新设计文档
+
+**核心更新**：
+- ✅ 更新DKG流程：反映Coordinator只通知第一个Participant启动，其他自动启动的实现
+- ✅ 更新协议引擎：详细说明tss-lib实现、广播消息处理（round=-1）、自动启动机制
+- ✅ 更新存储层：反映PostgreSQL和Redis的实际使用（双写策略、TTL管理、重试机制）
+- ✅ 更新通信协议：说明gRPC实现细节（KeepAlive、超时、消息路由、广播消息）
+- ✅ 更新API接口：列出实际实现的handlers和文件路径
+- ✅ 更新架构图：签名流程反映节点间直接通信，Coordinator不参与协议消息交换
+
+**技术细节更新**：
+- ✅ Coordinator服务：更新为实际实现（CreatePlaceholderKey、CreateKeyGenSession、NotifyParticipantsForDKG）
+- ✅ 会话管理：说明DKG会话使用keyID作为sessionID，签名会话使用session-{uuid}
+- ✅ 节点发现：优先从数据库查询，不足时从Consul发现
+- ✅ 密钥分片存储：说明实际存储格式（{node_id}.enc）和加密方式（AES-256-GCM）
+- ✅ 协议实现：基于tss-lib的GG18/GG20实现，支持广播消息和自动启动DKG
+
+**数据库更新**：
+- ✅ Keys表：说明状态流转（Pending → Active → Deleted）和占位符密钥机制
+- ✅ Signing Sessions表：说明DKG会话和签名会话的特殊用途
+- ✅ 索引和约束：反映实际创建的索引
 
 ### 2025-01-02 - 客户端集成与使用场景详解
 
